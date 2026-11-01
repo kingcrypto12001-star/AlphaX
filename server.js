@@ -9,7 +9,7 @@ const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
 
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "nbx12345";
-const VERCEL_APP_URL = "https://bnb-smart-miner.vercel.app/";
+const VERCEL_APP_URL = "https://bnb-smart-miner-2.vercel.app/";
 
 // ================== MINING RULES ==================
 const PLAN_DURATION_MS = 10 * 24 * 60 * 60 * 1000;
