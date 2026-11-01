@@ -9,7 +9,7 @@ const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
 
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "nbx12345";
-const VERCEL_APP_URL = "https://lite-core-0r7t.vercel.app/";
+const VERCEL_APP_URL = "https://bnb-smart-miner.vercel.app/";
 
 // ================== MINING RULES ==================
 const PLAN_DURATION_MS = 10 * 24 * 60 * 60 * 1000;
@@ -485,9 +485,9 @@ async function handleWebhookLogic(req, res) {
                 }
 
                 const welcomeCaption =
-`🎉 *Welcome to Lite Core!*
+`🎉 *Welcome to BNB Smart Miner!*
 
-_Mine LTC, invite friends and withdraw instantly._
+_Mine BNB, invite friends and withdraw instantly._
 
 ⛏️ Start mining with free power
 🎁 Buy plans & earn daily profit
@@ -499,8 +499,8 @@ _Mine LTC, invite friends and withdraw instantly._
 
                 const webAppMarkup = {
                     inline_keyboard: [
-                        [{ text: "📢 Join Official Channel", url: "https://t.me/litecoreofficial" }],
-                        [{ text: "💸 Join Payment Channel", url: "https://t.me/litecorepayments" }],
+                        [{ text: "📢 Join Official Channel", url: "https://t.me/bnbvaultofficial" }],
+                        [{ text: "💸 Join Payment Channel", url: "https://t.me/bnbvaultpayments" }],
                         [{ text: "⛏️ Open Mining", web_app: { url: VERCEL_APP_URL } }]
                     ]
                 };
@@ -509,7 +509,7 @@ _Mine LTC, invite friends and withdraw instantly._
 
             } else if (text === '/admin' && chatId === String(ADMIN_ID)) {
                 const renderAppUrl = process.env.RENDER_EXTERNAL_URL || "https://dashboard.render.com";
-                await sendTelegramMessage(chatId, `👑 **Lite Core Admin Access**\n\nClick below to open Login Page:`, {
+                await sendTelegramMessage(chatId, `👑 **BNB Smart Miner Admin Access**\n\nClick below to open Login Page:`, {
                     inline_keyboard: [[ { text: "🔐 Admin Login Panel", url: `${renderAppUrl}/admin/login` } ]]
                 });
             }
@@ -556,7 +556,7 @@ app.post('/webhook', handleWebhookLogic);
 app.post('/api/webhook/*', handleWebhookLogic);
 
 app.get('/', (req, res) => {
-    res.send(`<h1>Lite Core Mining Backend Active</h1><p>Please launch via Telegram Bot.</p>`);
+    res.send(`<h1>BNB Smart Miner Backend Active</h1><p>Please launch via Telegram Bot.</p>`);
 });
 
 // ================== ADMIN PANEL ==================
@@ -565,7 +565,7 @@ app.get('/admin/login', (req, res) => {
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Admin Login - Lite Core</title>
+            <title>Admin Login - BNB Smart Miner</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <style>
                 * { box-sizing: border-box; font-family: 'Segoe UI', sans-serif; }
@@ -685,7 +685,7 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
         <!DOCTYPE html>
         <html>
         <head>
-            <title>Lite Core Admin Panel</title>
+            <title>BNB Smart Miner Admin Panel</title>
             <meta name="viewport" content="width=device-width, initial-scale=1.0">
             <style>
                 * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
@@ -719,7 +719,7 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
         </head>
         <body>
             <div class="header">
-                <h1>👑 Lite Core Admin Panel</h1>
+                <h1>👑 BNB Smart Miner Admin Panel</h1>
                 <div>
                     <a href="/admin/logout" class="logout-btn">Logout</a>
                 </div>
@@ -1169,7 +1169,7 @@ app.post('/api/deposit', async (req, res) => {
         id: reqId,
         amount: amount,
         usdtAmount: exactUsdtVal,
-        coin: coin || 'LTC',
+        coin: coin || 'BNB',
         txHash: cleanTxHash,
         status: 'PENDING',
         date: new Date().toLocaleDateString()
@@ -1183,13 +1183,13 @@ app.post('/api/deposit', async (req, res) => {
         userId,
         amount: amount,
         usdtAmount: exactUsdtVal,
-        coin: coin || 'LTC',
+        coin: coin || 'BNB',
         txHash: cleanTxHash,
         status: 'PENDING'
     });
 
     if (ADMIN_ID) {
-        const msgText = `📥 **New Deposit Request**\n\n👤 User ID: \`${userId}\`\n💰 Amount: **${amount}** (${exactUsdtVal} USDT)\n🪙 Coin: **${coin || 'LTC'}**\n🔑 TxHash: \`${cleanTxHash}\``;
+        const msgText = `📥 **New Deposit Request**\n\n👤 User ID: \`${userId}\`\n💰 Amount: **${amount}** (${exactUsdtVal} USDT)\n🪙 Coin: **${coin || 'BNB'}**\n🔑 TxHash: \`${cleanTxHash}\``;
         const inlineKeyboard = {
             inline_keyboard: [[
                 { text: "✅ Approve", callback_data: `approve_${reqId}` },
@@ -1253,7 +1253,7 @@ app.post('/api/withdraw', async (req, res) => {
     });
 
     if (ADMIN_ID) {
-        const msgText = `📤 **New Withdraw Request**\n\n👤 User ID: \`${userId}\`\n💰 Amount: **${amt} LTC**\n🏦 Address: \`${address}\``;
+        const msgText = `📤 **New Withdraw Request**\n\n👤 User ID: \`${userId}\`\n💰 Amount: **${amt} BNB**\n🏦 Address: \`${address}\``;
         const inlineKeyboard = {
             inline_keyboard: [[
                 { text: "✅ Approve", callback_data: `approve_${reqId}` },
