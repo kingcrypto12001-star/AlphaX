@@ -487,21 +487,14 @@ async function handleWebhookLogic(req, res) {
                 const welcomeCaption =
 `🎉 *Welcome to BNB Smart Miner!*
 
-_Mine BNB, invite friends and withdraw instantly._
+⛏️ _Mine BNB, invite friends & earn rewards._ 💰 _Grow your earnings and withdraw directly to your wallet!_`;
 
-⛏️ Start mining with free power
-🎁 Buy plans & earn daily profit
-👥 Invite friends & earn 3-level commission
-💸 Withdraw straight to your wallet
-
-👇 *Tap Open Mining to start!*`;
-                const startPhotoUrl = "https://ibb.co/wFg2dtBX";
+                const startPhotoUrl = "https://i.ibb.co/jk5thdjj/file-000000003e3481f49aa5f2b114415564.png";
 
                 const webAppMarkup = {
                     inline_keyboard: [
-                        [{ text: "📢 Join Official Channel", url: "https://t.me/bnbvaultofficial" }],
-                        [{ text: "💸 Join Payment Channel", url: "https://t.me/bnbvaultpayments" }],
-                        [{ text: "⛏️ Open Mining", web_app: { url: VERCEL_APP_URL } }]
+                        [{ text: "📢 Join Official Channel", url: "https://t.me/Bnbsmartminer1" }],
+                        [{ text: "💸 Join Payment Channel", url: "https://t.me/paymentschanel12" }]
                     ]
                 };
 
