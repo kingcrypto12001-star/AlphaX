@@ -16,22 +16,22 @@ const PLAN_DURATION_MS = 10 * 24 * 60 * 60 * 1000;
 const PAID_RATE_PER_GHS_USD = 0.30;
 const FREE_DAILY_USD = 0.01;
 
-let ltcPriceCache = { price: 60, time: 0 };
-async function getLtcPrice() {
-    if (Date.now() - ltcPriceCache.time < 60000) return ltcPriceCache.price;
+let bnbPriceCache = { price: 620, time: 0 };
+async function getBnbPrice() {
+    if (Date.now() - bnbPriceCache.time < 60000) return bnbPriceCache.price;
     try {
-        const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=LTCUSDT');
+        const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT');
         const d = await r.json();
         const p = parseFloat(d.price);
-        if (p > 0) { ltcPriceCache = { price: p, time: Date.now() }; return p; }
+        if (p > 0) { bnbPriceCache = { price: p, time: Date.now() }; return p; }
     } catch (e) {}
     try {
-        const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd');
+        const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd');
         const d = await r.json();
-        const p = Number(d && d.litecoin && d.litecoin.usd);
-        if (p > 0) { ltcPriceCache = { price: p, time: Date.now() }; return p; }
+        const p = Number(d && d.binancecoin && d.binancecoin.usd);
+        if (p > 0) { bnbPriceCache = { price: p, time: Date.now() }; return p; }
     } catch (e) {}
-    return ltcPriceCache.price;
+    return bnbPriceCache.price;
 }
 
 function isPaidPlanActive(u, now = Date.now()) {
@@ -300,7 +300,7 @@ function setRequestStatus(list, reqId, pendingNames, newStatus) {
 async function payReferralCommissions(depositUser, usdtAmount) {
     const rates = [0.15, 0.03, 0.01];
     let current = depositUser;
-    const ltcPrice = await getLtcPrice();
+    const bnbPrice = await getBnbPrice();
     const depositingUserId = depositUser.id;
 
     for (let lvl = 1; lvl <= 3; lvl++) {
@@ -309,10 +309,10 @@ async function payReferralCommissions(depositUser, usdtAmount) {
         if (!refUser) break;
 
         const commUsdt = usdtAmount * rates[lvl - 1];
-        const commLtc = commUsdt / ltcPrice;
+        const commBnb = commUsdt / bnbPrice;
 
-        refUser.balance += commLtc;
-        refUser.refEarnings[`level${lvl}`] = (refUser.refEarnings[`level${lvl}`] || 0) + commLtc;
+        refUser.balance += commBnb;
+        refUser.refEarnings[`level${lvl}`] = (refUser.refEarnings[`level${lvl}`] || 0) + commBnb;
         refUser.markModified('refEarnings');
 
         if (!refUser.referrals[`level${lvl}`]) {
@@ -327,16 +327,16 @@ async function payReferralCommissions(depositUser, usdtAmount) {
                 refList[existingRefIndex] = {
                     id: depositingUserId,
                     joinedDate: 'Active',
-                    bonusEarned: commLtc
+                    bonusEarned: commBnb
                 };
             } else {
-                refList[existingRefIndex].bonusEarned = (Number(refList[existingRefIndex].bonusEarned) || 0) + commLtc;
+                refList[existingRefIndex].bonusEarned = (Number(refList[existingRefIndex].bonusEarned) || 0) + commBnb;
             }
         } else {
             refList.push({
                 id: depositingUserId,
                 joinedDate: 'Active',
-                bonusEarned: commLtc
+                bonusEarned: commBnb
             });
         }
         refUser.markModified(`referrals.level${lvl}`);
@@ -345,7 +345,7 @@ async function payReferralCommissions(depositUser, usdtAmount) {
 
         sendTelegramMessage(
             refUser.id, 
-            `🎁 Received +${commLtc.toFixed(4)} LTC ($${commUsdt.toFixed(2)} USDT) (${rates[lvl - 1] * 100}% Level ${lvl} Referral Commission)!`
+            `🎁 Received +${commBnb.toFixed(4)} BNB ($${commUsdt.toFixed(2)} USDT) (${rates[lvl - 1] * 100}% Level ${lvl} Referral Commission)!`
         );
         
         current = refUser;
@@ -376,7 +376,7 @@ async function approveRequest(reqDoc, u, reqId) {
         setRequestStatus(u.withdrawals, reqId, ['PENDING', 'PEND1NG'], 'PAID');
         u.markModified('withdrawals');
         await u.save();
-        sendTelegramMessage(reqDoc.userId, `✅ Your withdrawal of ${reqDoc.amount} LTC has been approved!`);
+        sendTelegramMessage(reqDoc.userId, `✅ Your withdrawal of ${reqDoc.amount} BNB has been approved!`);
     }
 }
 
@@ -613,7 +613,7 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
     const requests = await PendingRequest.find({});
     const totalUsers = await User.countDocuments();
     const allUsers = await User.find({});
-    const liveLtcPrice = await getLtcPrice();
+    const liveBnbPrice = await getBnbPrice();
 
     let totalPaidOut = 0;
     let totalGlobalDepositUsdt = 0;
@@ -644,12 +644,12 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
         }
     });
 
-    let totalGlobalDepositLtc = totalGlobalDepositUsdt / liveLtcPrice;
+    let totalGlobalDepositBnb = totalGlobalDepositUsdt / liveBnbPrice;
 
     let searchId = req.query.search ? req.query.search.trim() : '';
     let searchedUser = null;
     let userTotalDepositUsdt = 0;
-    let userTotalWithdrawLtc = 0;
+    let userTotalWithdrawBnb = 0;
     let userPaidWithdrawCount = 0;
     let totalRefEarn = 0;
 
@@ -669,7 +669,7 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
             if (searchedUser.withdrawals) {
                 searchedUser.withdrawals.forEach(w => {
                     if (w.status === 'PAID') {
-                        userTotalWithdrawLtc += parseFloat(w.amount || 0);
+                        userTotalWithdrawBnb += parseFloat(w.amount || 0);
                         userPaidWithdrawCount++;
                     }
                 });
@@ -726,15 +726,15 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
             </div>
 
             <div style="background: #1c1917; border: 1px solid #292524; border-radius: 10px; padding: 10px 15px; margin-bottom: 15px; font-size: 13px; color: #38bdf8; display: flex; justify-content: space-between; align-items: center;">
-                <span>📈 <b>Live LTC Price:</b> $${liveLtcPrice.toFixed(2)} USDT</span>
+                <span>📈 <b>Live BNB Price:</b> $${liveBnbPrice.toFixed(2)} USDT</span>
                 <span style="font-size: 11px; color: #a8a29e;">Auto-updated</span>
             </div>
 
             <div class="stats-grid">
                 <div class="stat-card"><div class="stat-title">Total Users</div><div class="stat-value">${totalUsers}</div></div>
-                <div class="stat-card"><div class="stat-title">Total User Deposit</div><div class="stat-value">${totalGlobalDepositUsdt.toFixed(2)} USDT<br><span style="font-size:13px; color:#22c55e;">(${totalGlobalDepositLtc.toFixed(4)} LTC)</span></div></div>
+                <div class="stat-card"><div class="stat-title">Total User Deposit</div><div class="stat-value">${totalGlobalDepositUsdt.toFixed(2)} USDT<br><span style="font-size:13px; color:#22c55e;">(${totalGlobalDepositBnb.toFixed(4)} BNB)</span></div></div>
                 <div class="stat-card"><div class="stat-title">Total Active Plan Users ($1+)</div><div class="stat-value">${activeDepositUsersCount} Users</div></div>
-                <div class="stat-card"><div class="stat-title">Paid Out</div><div class="stat-value">${totalPaidOut.toFixed(4)} LTC<br><span style="font-size:13px; color:#38bdf8;">($${(totalPaidOut * liveLtcPrice).toFixed(2)} USDT)</span></div></div>
+                <div class="stat-card"><div class="stat-title">Paid Out</div><div class="stat-value">${totalPaidOut.toFixed(4)} BNB<br><span style="font-size:13px; color:#38bdf8;">($${(totalPaidOut * liveBnbPrice).toFixed(2)} USDT)</span></div></div>
                 <div class="stat-card"><div class="stat-title">Pending Requests</div><div class="stat-value">${requests.length}</div></div>
             </div>
 
@@ -758,14 +758,14 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
                                         if (d.status === 'PAID') depTotalUsdt += parseFloat(d.usdtAmount || 1);
                                     });
                                 }
-                                let depTotalLtc = depTotalUsdt / liveLtcPrice;
+                                let depTotalBnb = depTotalUsdt / liveBnbPrice;
                                 let displayUname = depUser.username ? (depUser.username.startsWith('@') ? depUser.username : '@' + depUser.username) : '@User';
                                 let planDaysStr = getPlanDaysFormat(depUser);
                                 return `
                                     <tr>
                                         <td><code>${depUser.id}</code></td>
                                         <td>${displayUname}</td>
-                                        <td><b style="color:#22c55e;">${depTotalUsdt.toFixed(2)} USDT</b><br><span style="font-size:10px; color:#38bdf8;">(${depTotalLtc.toFixed(4)} LTC)</span></td>
+                                        <td><b style="color:#22c55e;">${depTotalUsdt.toFixed(2)} USDT</b><br><span style="font-size:10px; color:#38bdf8;">(${depTotalBnb.toFixed(4)} BNB)</span></td>
                                         <td><b>${depUser.ghs} GHS</b></td>
                                         <td><b style="color:#38bdf8;">${planDaysStr}</b></td>
                                     </tr>
@@ -786,13 +786,13 @@ app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
                     ${searchedUser ? `
                         <div class="user-details-box">
                             <p>👤 <b>User Name:</b> ${searchedUser.username.startsWith('@' ) ? searchedUser.username : '@' + searchedUser.username} | <b>ID:</b> <code>${searchedUser.id}</code></p>
-                            <p>💰 <b>Current Balance:</b> <span style="color:#38bdf8; font-weight:bold;">${searchedUser.balance.toFixed(4)} LTC</span> <span style="color:#22c55e;">($${(searchedUser.balance * liveLtcPrice).toFixed(2)} USDT)</span> | ⚡ <b>GHS Power:</b> ${searchedUser.ghs} GHS</p>
+                            <p>💰 <b>Current Balance:</b> <span style="color:#38bdf8; font-weight:bold;">${searchedUser.balance.toFixed(4)} BNB</span> <span style="color:#22c55e;">($${(searchedUser.balance * liveBnbPrice).toFixed(2)} USDT)</span> | ⚡ <b>GHS Power:</b> ${searchedUser.ghs} GHS</p>
                             <p>🚫 <b>Account Status:</b> ${searchedUser.isBanned ? '<span style="color:#ef4444; font-weight:bold;">BANNED</span>' : '<span style="color:#22c55e; font-weight:bold;">ACTIVE</span>'}</p>
                             <p>⚡ <b>Mining Plan Status:</b> ${searchedUser.planActive !== false && searchedUser.ghs > 0 ? '<span style="color:#22c55e; font-weight:bold;">ACTIVE (' + getPlanDaysFormat(searchedUser) + ')</span>' : '<span style="color:#ef4444; font-weight:bold;">DEACTIVATED / EXPIRED (Free plan)</span>'}</p>
-                            <p>📥 <b>Total Approved Deposit:</b> <span style="color:#22c55e; font-weight:bold;">${userTotalDepositUsdt.toFixed(2)} USDT</span> <span style="color:#38bdf8;">(${(userTotalDepositUsdt / liveLtcPrice).toFixed(4)} LTC)</span></p>
-                            <p>📤 <b>Total Approved Withdraw:</b> <span style="color:#ef4444; font-weight:bold;">${userTotalWithdrawLtc.toFixed(4)} LTC</span> <span style="color:#38bdf8;">($${(userTotalWithdrawLtc * liveLtcPrice).toFixed(2)} USDT)</span> (<span style="color:#38bdf8;">${userPaidWithdrawCount} Times Paid</span>)</p>
+                            <p>📥 <b>Total Approved Deposit:</b> <span style="color:#22c55e; font-weight:bold;">${userTotalDepositUsdt.toFixed(2)} USDT</span> <span style="color:#38bdf8;">(${(userTotalDepositUsdt / liveBnbPrice).toFixed(4)} BNB)</span></p>
+                            <p>📤 <b>Total Approved Withdraw:</b> <span style="color:#ef4444; font-weight:bold;">${userTotalWithdrawBnb.toFixed(4)} BNB</span> <span style="color:#38bdf8;">($${(userTotalWithdrawBnb * liveBnbPrice).toFixed(2)} USDT)</span> (<span style="color:#38bdf8;">${userPaidWithdrawCount} Times Paid</span>)</p>
                             <p>👥 <b>Referrals Count:</b> L1: ${searchedUser.referrals?.level1?.length || 0} | L2: ${searchedUser.referrals?.level2?.length || 0} | L3: ${searchedUser.referrals?.level3?.length || 0}</p>
-                            <p>🎁 <b>Total Referral Commission:</b> <span style="color:#38bdf8; font-weight:bold;">${totalRefEarn.toFixed(4)} LTC</span> <span style="color:#22c55e;">($${(totalRefEarn * liveLtcPrice).toFixed(2)} USDT)</span></p>
+                            <p>🎁 <b>Total Referral Commission:</b> <span style="color:#38bdf8; font-weight:bold;">${totalRefEarn.toFixed(4)} BNB</span> <span style="color:#22c55e;">($${(totalRefEarn * liveBnbPrice).toFixed(2)} USDT)</span></p>
                             <p>🔗 <b>Referred By ID:</b> ${searchedUser.referredBy || 'Direct Join'}</p>
                             <hr style="border-color:#292524; margin:12px 0;">
                             <b>⚙️ Manage User Balance, Plan & Status:</b>
@@ -999,13 +999,13 @@ app.post('/admin/manage-balance', checkAdminAuth, async (req, res) => {
     let amt = parseFloat(amount);
     if (action === 'add') {
         u.balance += amt;
-        sendTelegramMessage(userId, `🎁 Admin added +${amt} LTC to your balance!`);
+        sendTelegramMessage(userId, `🎁 Admin added +${amt} BNB to your balance!`);
     } else {
         u.balance = Math.max(0, u.balance - amt);
-        sendTelegramMessage(userId, `⚠️ Admin deducted -${amt} LTC from your balance.`);
+        sendTelegramMessage(userId, `⚠️ Admin deducted -${amt} BNB from your balance.`);
     }
     await u.save();
-    res.json({ success: true, message: `Successfully ${action}ed ${amt} LTC for user ${userId}!` });
+    res.json({ success: true, message: `Successfully ${action}ed ${amt} BNB for user ${userId}!` });
 });
 
 app.post('/admin/ban-user', checkAdminAuth, async (req, res) => {
@@ -1069,7 +1069,7 @@ app.get('/api/user/:userId', async (req, res) => {
         await user.save();
     }
 
-    const price = await getLtcPrice();
+    const price = await getBnbPrice();
     const data = user.toObject();
 
     ['level1', 'level2', 'level3'].forEach(lvl => {
@@ -1090,7 +1090,7 @@ app.get('/api/user/:userId', async (req, res) => {
     data.pendingUsd = Number(user.accruedUsd || 0) + accrueUsd(user, now);
     data.dailyUsd = dailyUsdRate(user, now);
     data.paidPlan = isPaidPlanActive(user, now);
-    data.ltcPrice = price;
+    data.bnbPrice = price;
     res.json(data);
 });
 
@@ -1110,12 +1110,12 @@ app.post('/api/claim', async (req, res) => {
     const totalUsd = Number(u.accruedUsd || 0) + accrueUsd(u, now);
     if (!(totalUsd > 0)) return res.status(400).json({ success: false, message: "Nothing to collect yet" });
 
-    const price = await getLtcPrice();
-    const ltcAmount = totalUsd / price;
+    const price = await getBnbPrice();
+    const bnbAmount = totalUsd / price;
 
     const updated = await User.findOneAndUpdate(
         { id: userId, lastClaimTime: u.lastClaimTime },
-        { $inc: { balance: ltcAmount }, $set: { accruedUsd: 0, lastClaimTime: now } },
+        { $inc: { balance: bnbAmount }, $set: { accruedUsd: 0, lastClaimTime: now } },
         { new: true }
     );
     if (!updated) return res.status(409).json({ success: false, message: "Please try again." });
@@ -1124,9 +1124,9 @@ app.post('/api/claim', async (req, res) => {
         success: true,
         balance: updated.balance,
         lastClaimTime: updated.lastClaimTime,
-        claimedLtc: ltcAmount,
+        claimedBnb: bnbAmount,
         claimedUsd: totalUsd,
-        ltcPrice: price
+        bnbPrice: price
     });
 });
 
