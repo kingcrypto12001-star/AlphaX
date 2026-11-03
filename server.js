@@ -61,7 +61,9 @@ function accrueUsd(u, now = Date.now()) {
 }
 
 function settleAccrual(u, now = Date.now()) {
-    u.accruedUsd = Number(u.accruedUsd || 0) + accrueUsd(u, now);
+    const accrued = accrueUsd(u, now);
+    u.accruedUsd = Number(u.accruedUsd || 0) + accrued;
+    u.totalMinedUsd = Number(u.totalMinedUsd || 0) + accrued;
     u.lastClaimTime = now;
 }
 
@@ -111,6 +113,8 @@ const userSchema = new mongoose.Schema({
     id: { type: String, required: true, unique: true },
     username: { type: String, default: 'User' },
     balance: { type: Number, default: 0 },
+    totalMinedUsd: { type: Number, default: 0 },
+    totalWithdrawnBnb: { type: Number, default: 0 },
     ghs: { type: Number, default: 0 },
     lastClaimTime: { type: Number, default: Date.now },
     accruedUsd: { type: Number, default: 0 },
@@ -374,6 +378,7 @@ async function approveRequest(reqDoc, u, reqId) {
         sendTelegramMessage(reqDoc.userId, `✅ Your deposit of ${reqDoc.amount} has been approved!\n⚡ +${depAmount} GHS Mining Power added (Valid for 10 Days).\n⛏️ Mining is now active. Collect your profit anytime from the app.`);
     } else if (reqDoc.type === 'withdraw' && u) {
         setRequestStatus(u.withdrawals, reqId, ['PENDING', 'PEND1NG'], 'PAID');
+        u.totalWithdrawnBnb = Number(u.totalWithdrawnBnb || 0) + parseFloat(reqDoc.amount || 0);
         u.markModified('withdrawals');
         await u.save();
         sendTelegramMessage(reqDoc.userId, `✅ Your withdrawal of ${reqDoc.amount} BNB has been approved!`);
@@ -1100,23 +1105,23 @@ app.post('/api/claim', async (req, res) => {
     if (!u || u.isBanned) return res.status(400).json({ success: false, message: "User not found or banned" });
 
     const now = Date.now();
-    const totalUsd = Number(u.accruedUsd || 0) + accrueUsd(u, now);
+    const accrued = accrueUsd(u, now);
+    const totalUsd = Number(u.accruedUsd || 0) + accrued;
     if (!(totalUsd > 0)) return res.status(400).json({ success: false, message: "Nothing to collect yet" });
 
     const price = await getBnbPrice();
     const bnbAmount = totalUsd / price;
 
-    const updated = await User.findOneAndUpdate(
-        { id: userId, lastClaimTime: u.lastClaimTime },
-        { $inc: { balance: bnbAmount }, $set: { accruedUsd: 0, lastClaimTime: now } },
-        { new: true }
-    );
-    if (!updated) return res.status(409).json({ success: false, message: "Please try again." });
+    u.balance += bnbAmount;
+    u.totalMinedUsd = Number(u.totalMinedUsd || 0) + totalUsd;
+    u.accruedUsd = 0;
+    u.lastClaimTime = now;
+    await u.save();
 
     res.json({
         success: true,
-        balance: updated.balance,
-        lastClaimTime: updated.lastClaimTime,
+        balance: u.balance,
+        lastClaimTime: u.lastClaimTime,
         claimedBnb: bnbAmount,
         claimedUsd: totalUsd,
         bnbPrice: price
