@@ -26,13 +26,11 @@ const TASK_REWARD = 500;
 const REF_BONUS = 500;
 const MIN_WITHDRAW = 5000;
 const COOLDOWN = 24 * 60 * 60 * 1000;
-const YT_WAIT = 15000;
 
-// Order important hai: 0 = verify channel, 1 = Task 1, 2 = Task 2
+// Sirf 2 channels (Index 0 aur 1)
 const CHANNELS = [
-    { id: '@updatechanneluta', name: 'Channel 2' },
-    { id: '@paymentchanneluta', name: 'Task 1 Channel' },
-    { id: '@cryptotech16', name: 'Task 2 Channel' }
+    { id: '@updatechanneluta', name: 'Channel 1' },
+    { id: '@paymentchanneluta', name: 'Channel 2' }
 ];
 
 // ================== DATABASE ==================
@@ -47,8 +45,7 @@ const User = mongoose.model('User', new mongoose.Schema({
     lastClaimTime: { type: Number, default: 0 },
     isVerified: { type: Boolean, default: false },
     isBanned: { type: Boolean, default: false },
-    tasks: { task1: { type: Boolean, default: false }, task2: { type: Boolean, default: false }, task3: { type: Boolean, default: false } },
-    ytStart: { type: Number, default: 0 },
+    tasks: { task1: { type: Boolean, default: false }, task2: { type: Boolean, default: false } },
     referredBy: { type: String, default: null },
     refCredited: { type: Boolean, default: false },
     referrals: { type: Array, default: [] },
@@ -87,13 +84,13 @@ async function isMember(channel, userId) {
     const s = r.result.status;
     return ['member', 'administrator', 'creator'].includes(s) || (s === 'restricted' && r.result.is_member === true);
 }
-async function checkChannels(userId, idxs = [0]) {
+async function checkChannels(userId, idxs = [0, 1]) {
     const missing = [];
     for (const i of idxs) {
         const ch = CHANNELS[i];
         if (!ch) return { ok: false, error: 'Invalid channel' };
         const m = await isMember(ch.id, userId);
-        if (m === null) return { ok: false, error: 'Channel check failed. Bot ko channel me admin banao.' };
+        if (m === null) return { ok: false, error: 'Channel check failed. Please make sure bot is admin in the channels.' };
         if (!m) missing.push(ch.name);
     }
     return { ok: missing.length === 0, missing };
@@ -120,7 +117,7 @@ function displayName(u) { return u.username ? `@${u.username}` : (u.first_name |
 async function auth(req, res, next) {
     try {
         const u = validateInitData(req.headers['x-init-data']);
-        if (!u || !u.id) return res.status(401).json({ ok: false, error: 'Bot ke "Open AlphaX" button se app kholo.' });
+        if (!u || !u.id) return res.status(401).json({ ok: false, error: 'Please open the app via the "Open AlphaX" button inside the bot.' });
         const id = String(u.id);
         const user = await User.findOneAndUpdate({ id }, { $set: { username: displayName(u) } }, { upsert: true, new: true, setDefaultsOnInsert: true });
         if (user.isBanned) return res.status(403).json({ ok: false, banned: true, error: 'Your account is banned.' });
@@ -133,7 +130,7 @@ function publicUser(u) {
     return {
         id: u.id, username: u.username, balance: u.balance, lastClaimTime: u.lastClaimTime, serverTime: Date.now(),
         isVerified: u.isVerified,
-        tasks: { task1: !!u.tasks.task1, task2: !!u.tasks.task2, task3: !!u.tasks.task3 },
+        tasks: { task1: !!u.tasks.task1, task2: !!u.tasks.task2 },
         referrals: u.referrals, withdrawals: u.withdrawals.slice(0, 50)
     };
 }
@@ -148,7 +145,7 @@ app.get('/health', (req, res) => res.send('OK'));
 // ================== MINI APP API ==================
 app.post('/api/me', auth, wrap(async (req, res) => {
     let u = req.user;
-    if (u.isVerified) { // channel leave kiya to dobara verify maangega
+    if (u.isVerified) { 
         const r = await checkChannels(u.id);
         if (!r.ok && !r.error) { await User.updateOne({ id: u.id }, { isVerified: false }); u = await User.findOne({ id: u.id }); }
     }
@@ -162,7 +159,6 @@ app.post('/api/verify', auth, wrap(async (req, res) => {
     if (!r.ok) return res.json({ ok: false, missing: r.missing });
     await User.updateOne({ id: u.id }, { isVerified: true });
 
-    // Referral: friend verify kare tabhi referrer ko 500 SHIBA (sirf ek baar)
     if (u.referredBy && !u.refCredited) {
         const claimed = await User.findOneAndUpdate({ id: u.id, refCredited: false }, { refCredited: true });
         if (claimed) {
@@ -178,12 +174,11 @@ app.post('/api/verify', auth, wrap(async (req, res) => {
 
 app.post('/api/claim', auth, wrap(async (req, res) => {
     if (!req.user.isVerified) return res.json({ ok: false, error: 'Please verify channels first.' });
-    // Claim se pehle bhi channel check
     const c = await checkChannels(req.user.id);
     if (c.error) return res.json({ ok: false, error: c.error });
     if (!c.ok) {
         await User.updateOne({ id: req.user.id }, { isVerified: false });
-        return res.json({ ok: false, error: 'Pehle channel join karo!' });
+        return res.json({ ok: false, error: 'Please join the required channels first!' });
     }
     const now = Date.now();
     const u = await User.findOneAndUpdate(
@@ -193,23 +188,16 @@ app.post('/api/claim', auth, wrap(async (req, res) => {
     res.json({ ok: true, data: publicUser(u) });
 }));
 
-app.post('/api/task/start', auth, wrap(async (req, res) => {
-    await User.updateOne({ id: req.user.id }, { ytStart: Date.now() });
-    res.json({ ok: true });
-}));
-
 app.post('/api/task', auth, wrap(async (req, res) => {
     const id = Number(req.body.taskId);
-    if (![1, 2, 3].includes(id)) return res.json({ ok: false, error: 'Invalid task' });
+    if (![1, 2].includes(id)) return res.json({ ok: false, error: 'Invalid task' });
     const u = req.user;
     if (!u.isVerified) return res.json({ ok: false, error: 'Please verify channels first.' });
-    if (id === 3) {
-        if (!u.ytStart || Date.now() - u.ytStart < YT_WAIT) return res.json({ ok: false, error: 'Pehle YouTube kholo aur 15 sec ruko, phir Check karo.' });
-    } else {
-        const r = await checkChannels(u.id, [id]); // task1 -> index 1, task2 -> index 2
-        if (r.error) return res.json({ ok: false, error: r.error });
-        if (!r.ok) return res.json({ ok: false, error: 'Pehle channel join karo!' });
-    }
+    
+    const r = await checkChannels(u.id, [id - 1]); 
+    if (r.error) return res.json({ ok: false, error: r.error });
+    if (!r.ok) return res.json({ ok: false, error: 'Please join the channel first!' });
+
     const key = `tasks.task${id}`;
     const done = await User.findOneAndUpdate({ id: u.id, [key]: false }, { $set: { [key]: true }, $inc: { balance: TASK_REWARD } }, { new: true });
     if (!done) return res.json({ ok: false, error: 'Task already claimed.' });
@@ -223,7 +211,7 @@ app.post('/api/withdraw', auth, wrap(async (req, res) => {
     if (!u.isVerified) return res.json({ ok: false, error: 'Please verify channels first.' });
     if (!/^0x[a-fA-F0-9]{40}$/.test(address)) return res.json({ ok: false, error: 'Invalid BEP-20 wallet address!' });
     if (!Number.isFinite(amt) || amt < MIN_WITHDRAW) return res.json({ ok: false, error: `Minimum withdrawal is ${MIN_WITHDRAW} SHIBA!` });
-    if (await PendingRequest.findOne({ userId: u.id })) return res.json({ ok: false, error: 'Aapki ek withdrawal request pehle se pending hai.' });
+    if (await PendingRequest.findOne({ userId: u.id })) return res.json({ ok: false, error: 'You already have a pending withdrawal request.' });
 
     const reqId = 'wd_' + crypto.randomBytes(6).toString('hex');
     const upd = await User.findOneAndUpdate({ id: u.id, balance: { $gte: amt } }, {
@@ -277,7 +265,7 @@ app.post('/api/webhook', async (req, res) => {
 
                 const kb = [];
                 if (PUBLIC_URL.startsWith('https://')) kb.push([{ text: '🚀 Open AlphaX', web_app: { url: PUBLIC_URL } }]);
-                kb.push([{ text: '📢 Join Channel 1', url: 'https://t.me/paymentchanneluta' }, { text: '📢 Join Channel 2', url: 'https://t.me/updatechanneluta' }]);
+                kb.push([{ text: '📢 Join Channel 1', url: 'https://t.me/updatechanneluta' }, { text: '📢 Join Channel 2', url: 'https://t.me/paymentchanneluta' }]);
                 await sendMsg(chatId, `🔥 <b>Welcome to AlphaX!</b>\n\n⛏️ Claim <b>1000 SHIBA</b> free every 24 hours.\n🎁 Complete tasks and invite friends to earn <b>500 SHIBA</b> each.\n\n👇 Tap below to start.`, { inline_keyboard: kb });
             } else if (text === '/admin' && chatId === ADMIN_ID) {
                 await sendMsg(chatId, '👑 <b>AlphaX Admin</b>', PUBLIC_URL ? { inline_keyboard: [[{ text: '🔐 Admin Login Panel', url: `${PUBLIC_URL}/admin/login` }]] } : undefined);
