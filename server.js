@@ -4,15 +4,15 @@ const crypto = require('crypto');
 const path = require('path');
 const app = express();
 app.disable('x-powered-by');
+app.set('trust proxy', 1); // Render proxy ke peeche sahi IP (login rate-limit ke liye)
 
-// ================== SETTINGS (sab secrets Environment Variables se) ==================
+// ================== SETTINGS (Environment Variables) ==================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = String(process.env.ADMIN_ID || '7482625921');
 const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
-const BOT_USERNAME = 'AlphaXEarnTg_bot';
 
 if (!BOT_TOKEN || !MONGO_URI || !ADMIN_USERNAME || !ADMIN_PASSWORD) {
     console.error('❌ Missing env: BOT_TOKEN, MONGO_URI, ADMIN_USERNAME, ADMIN_PASSWORD are required.');
@@ -21,18 +21,21 @@ if (!BOT_TOKEN || !MONGO_URI || !ADMIN_USERNAME || !ADMIN_PASSWORD) {
 const WEBHOOK_SECRET = crypto.createHash('sha256').update('wh' + BOT_TOKEN).digest('hex').slice(0, 32);
 
 // ================== RULES ==================
-const DAILY = 1000;            // free mining per 24h
-const TASK_REWARD = 500;       // per task
-const REF_BONUS = 500;         // 1 level referral
+const DAILY = 1000;
+const TASK_REWARD = 500;
+const REF_BONUS = 500;
 const MIN_WITHDRAW = 5000;
 const COOLDOWN = 24 * 60 * 60 * 1000;
-const YT_WAIT = 15000;         // YouTube task: kholne ke baad kam se kam 15 sec
+const YT_WAIT = 15000;
+
+// Order important hai: 0 = verify channel, 1 = Task 1, 2 = Task 2
 const CHANNELS = [
-    { id: '@paymentchanneluta', name: 'Channel 1' },
-    { id: '@updatechanneluta', name: 'Channel 2' }
+    { id: '@updatechanneluta', name: 'Channel 2' },
+    { id: '@paymentchanneluta', name: 'Task 1 Channel' },
+    { id: '@cryptotech16', name: 'Task 2 Channel' }
 ];
 
-// ================== DATABASE (naya, khali data) ==================
+// ================== DATABASE ==================
 mongoose.connect(MONGO_URI)
     .then(() => console.log('✅ MongoDB connected'))
     .catch(err => { console.error('❌ MongoDB error:', err.message); process.exit(1); });
@@ -77,25 +80,26 @@ async function tg(method, body) {
 const sendMsg = (chat_id, text, reply_markup, html = true) =>
     tg('sendMessage', { chat_id, text, reply_markup, ...(html ? { parse_mode: 'HTML' } : {}) });
 
-// Channel membership (bot dono channels me ADMIN hona chahiye)
+// Bot in channels ka ADMIN hona zaroori hai
 async function isMember(channel, userId) {
     const r = await tg('getChatMember', { chat_id: channel, user_id: Number(userId) });
-    if (!r.ok) return null;
+    if (!r.ok) { console.log('getChatMember failed for', channel, r.description || ''); return null; }
     const s = r.result.status;
     return ['member', 'administrator', 'creator'].includes(s) || (s === 'restricted' && r.result.is_member === true);
 }
-async function checkChannels(userId, idxs = [0, 1]) {
-    const joined = [], missing = [];
+async function checkChannels(userId, idxs = [0]) {
+    const missing = [];
     for (const i of idxs) {
-        const m = await isMember(CHANNELS[i].id, userId);
-        if (m === null) return { ok: false, error: 'Channel check failed. Try again later.' };
-        joined.push({ i, joined: m });
-        if (!m) missing.push(CHANNELS[i].name);
+        const ch = CHANNELS[i];
+        if (!ch) return { ok: false, error: 'Invalid channel' };
+        const m = await isMember(ch.id, userId);
+        if (m === null) return { ok: false, error: 'Channel check failed. Bot ko channel me admin banao.' };
+        if (!m) missing.push(ch.name);
     }
-    return { ok: missing.length === 0, missing, joined };
+    return { ok: missing.length === 0, missing };
 }
 
-// Telegram Mini App signature check (fake user ID se koi bypass nahi kar sakta)
+// Telegram Mini App signature check
 function validateInitData(initData) {
     if (!initData || initData.length > 4096) return null;
     const p = new URLSearchParams(initData);
@@ -116,7 +120,7 @@ function displayName(u) { return u.username ? `@${u.username}` : (u.first_name |
 async function auth(req, res, next) {
     try {
         const u = validateInitData(req.headers['x-init-data']);
-        if (!u || !u.id) return res.status(401).json({ ok: false, error: 'Please open this app from the AlphaX bot.' });
+        if (!u || !u.id) return res.status(401).json({ ok: false, error: 'Bot ke "Open AlphaX" button se app kholo.' });
         const id = String(u.id);
         const user = await User.findOneAndUpdate({ id }, { $set: { username: displayName(u) } }, { upsert: true, new: true, setDefaultsOnInsert: true });
         if (user.isBanned) return res.status(403).json({ ok: false, banned: true, error: 'Your account is banned.' });
@@ -139,11 +143,12 @@ app.use(express.json({ limit: '10kb' }));
 app.use(express.urlencoded({ extended: false, limit: '10kb' }));
 app.use((req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); next(); });
 app.use(express.static(path.join(__dirname, 'public')));
+app.get('/health', (req, res) => res.send('OK'));
 
 // ================== MINI APP API ==================
 app.post('/api/me', auth, wrap(async (req, res) => {
     let u = req.user;
-    if (u.isVerified) { // har baar check: channel leave kiya to dobara verify
+    if (u.isVerified) { // channel leave kiya to dobara verify maangega
         const r = await checkChannels(u.id);
         if (!r.ok && !r.error) { await User.updateOne({ id: u.id }, { isVerified: false }); u = await User.findOne({ id: u.id }); }
     }
@@ -154,10 +159,10 @@ app.post('/api/verify', auth, wrap(async (req, res) => {
     const u = req.user;
     const r = await checkChannels(u.id);
     if (r.error) return res.json({ ok: false, error: r.error });
-    if (!r.ok) return res.json({ ok: false, missing: r.missing, joined: r.joined });
+    if (!r.ok) return res.json({ ok: false, missing: r.missing });
     await User.updateOne({ id: u.id }, { isVerified: true });
 
-    // 1 level referral: friend verify kare tabhi referrer ko 500 SHIBA (ek hi baar)
+    // Referral: friend verify kare tabhi referrer ko 500 SHIBA (sirf ek baar)
     if (u.referredBy && !u.refCredited) {
         const claimed = await User.findOneAndUpdate({ id: u.id, refCredited: false }, { refCredited: true });
         if (claimed) {
@@ -173,6 +178,13 @@ app.post('/api/verify', auth, wrap(async (req, res) => {
 
 app.post('/api/claim', auth, wrap(async (req, res) => {
     if (!req.user.isVerified) return res.json({ ok: false, error: 'Please verify channels first.' });
+    // Claim se pehle bhi channel check
+    const c = await checkChannels(req.user.id);
+    if (c.error) return res.json({ ok: false, error: c.error });
+    if (!c.ok) {
+        await User.updateOne({ id: req.user.id }, { isVerified: false });
+        return res.json({ ok: false, error: 'Pehle channel join karo!' });
+    }
     const now = Date.now();
     const u = await User.findOneAndUpdate(
         { id: req.user.id, lastClaimTime: { $lte: now - COOLDOWN } },
@@ -192,9 +204,9 @@ app.post('/api/task', auth, wrap(async (req, res) => {
     const u = req.user;
     if (!u.isVerified) return res.json({ ok: false, error: 'Please verify channels first.' });
     if (id === 3) {
-        if (!u.ytStart || Date.now() - u.ytStart < YT_WAIT) return res.json({ ok: false, error: 'Pehle YouTube kholo aur thodi der ruko, phir Check karo.' });
+        if (!u.ytStart || Date.now() - u.ytStart < YT_WAIT) return res.json({ ok: false, error: 'Pehle YouTube kholo aur 15 sec ruko, phir Check karo.' });
     } else {
-        const r = await checkChannels(u.id, [id - 1]);
+        const r = await checkChannels(u.id, [id]); // task1 -> index 1, task2 -> index 2
         if (r.error) return res.json({ ok: false, error: r.error });
         if (!r.ok) return res.json({ ok: false, error: 'Pehle channel join karo!' });
     }
@@ -227,7 +239,7 @@ app.post('/api/withdraw', auth, wrap(async (req, res) => {
     res.json({ ok: true, data: publicUser(upd) });
 }));
 
-// ================== REQUEST APPROVE / REJECT ==================
+// ================== APPROVE / REJECT ==================
 async function processRequest(reqId, action) {
     const r = await PendingRequest.findOneAndDelete({ reqId });
     if (!r) return null;
@@ -261,7 +273,6 @@ app.post('/api/webhook', async (req, res) => {
                 if (referrer && !(await User.exists({ id: referrer }))) referrer = null;
                 const name = displayName(msg.from);
                 const user = await User.findOneAndUpdate({ id: chatId }, { $set: { username: name } }, { upsert: true, new: true, setDefaultsOnInsert: true });
-                // referrer sirf naye user (jo abhi verify nahi hua) ke liye set hota hai
                 if (referrer && !user.referredBy && !user.isVerified) await User.updateOne({ id: chatId, referredBy: null }, { referredBy: referrer });
 
                 const kb = [];
@@ -414,7 +425,7 @@ app.post('/admin/broadcast', checkAdmin, wrap(async (req, res) => {
     if (!message.trim()) return res.json({ ok: false, message: 'Empty message' });
     const ids = (await User.find({ isBanned: false }, { id: 1 })).map(u => u.id);
     res.json({ ok: true, message: `Broadcast started for ${ids.length} users.` });
-    for (const id of ids) { await sendMsg(id, message, undefined, false); await sleep(60); } // Telegram limit se bachne ke liye
+    for (const id of ids) { await sendMsg(id, message, undefined, false); await sleep(60); }
 }));
 
 // ================== START ==================
