@@ -1,1279 +1,430 @@
 const express = require('express');
 const mongoose = require('mongoose');
+const crypto = require('crypto');
+const path = require('path');
 const app = express();
+app.disable('x-powered-by');
 
-// ================== SETTINGS ==================
-const BOT_TOKEN = "9107042388:AAFv0PnNLBlHiGfcX4Xd09TghNuwOojFcpU";
-const ADMIN_ID = "7482625921";
+// ================== SETTINGS (sab secrets Environment Variables se) ==================
+const BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_ID = String(process.env.ADMIN_ID || '7482625921');
 const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
+const ADMIN_USERNAME = process.env.ADMIN_USERNAME;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
+const PUBLIC_URL = (process.env.PUBLIC_URL || process.env.RENDER_EXTERNAL_URL || '').replace(/\/$/, '');
+const BOT_USERNAME = 'AlphaXEarnTg_bot';
 
-const ADMIN_USERNAME = process.env.ADMIN_USERNAME || "admin";
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || "nbx12345";
-const VERCEL_APP_URL = "https://bnb-smart-miner-2.vercel.app/";
-
-// ================== MINING RULES ==================
-const PLAN_DURATION_MS = 10 * 24 * 60 * 60 * 1000;
-const PAID_RATE_PER_GHS_USD = 0.30;
-const FREE_DAILY_USD = 0.01;
-
-let bnbPriceCache = { price: 620, time: 0 };
-async function getBnbPrice() {
-    if (Date.now() - bnbPriceCache.time < 60000) return bnbPriceCache.price;
-    try {
-        const r = await fetch('https://api.binance.com/api/v3/ticker/price?symbol=BNBUSDT');
-        const d = await r.json();
-        const p = parseFloat(d.price);
-        if (p > 0) { bnbPriceCache = { price: p, time: Date.now() }; return p; }
-    } catch (e) {}
-    try {
-        const r = await fetch('https://api.coingecko.com/api/v3/simple/price?ids=binancecoin&vs_currencies=usd');
-        const d = await r.json();
-        const p = Number(d && d.binancecoin && d.binancecoin.usd);
-        if (p > 0) { bnbPriceCache = { price: p, time: Date.now() }; return p; }
-    } catch (e) {}
-    return bnbPriceCache.price;
+if (!BOT_TOKEN || !MONGO_URI || !ADMIN_USERNAME || !ADMIN_PASSWORD) {
+    console.error('❌ Missing env: BOT_TOKEN, MONGO_URI, ADMIN_USERNAME, ADMIN_PASSWORD are required.');
+    process.exit(1);
 }
+const WEBHOOK_SECRET = crypto.createHash('sha256').update('wh' + BOT_TOKEN).digest('hex').slice(0, 32);
 
-function isPaidPlanActive(u, now = Date.now()) {
-    return u.planActive !== false && Number(u.ghs) > 0 && !(u.planExpiryDate > 0 && now >= u.planExpiryDate);
-}
+// ================== RULES ==================
+const DAILY = 1000;            // free mining per 24h
+const TASK_REWARD = 500;       // per task
+const REF_BONUS = 500;         // 1 level referral
+const MIN_WITHDRAW = 5000;
+const COOLDOWN = 24 * 60 * 60 * 1000;
+const YT_WAIT = 15000;         // YouTube task: kholne ke baad kam se kam 15 sec
+const CHANNELS = [
+    { id: '@paymentchanneluta', name: 'Channel 1' },
+    { id: '@updatechanneluta', name: 'Channel 2' }
+];
 
-function dailyUsdRate(u, now = Date.now()) {
-    return isPaidPlanActive(u, now) ? Number(u.ghs) * PAID_RATE_PER_GHS_USD : FREE_DAILY_USD;
-}
-
-function accrueUsd(u, now = Date.now()) {
-    const last = Number(u.lastClaimTime) || now;
-    if (now <= last) return 0;
-    let usd = 0;
-    let cursor = last;
-    if (u.planActive !== false && Number(u.ghs) > 0) {
-        const paidEnd = (u.planExpiryDate > 0) ? Math.min(now, u.planExpiryDate) : now;
-        if (paidEnd > cursor) {
-            usd += ((paidEnd - cursor) / 1000) * (Number(u.ghs) * PAID_RATE_PER_GHS_USD / 86400);
-            cursor = paidEnd;
-        }
-    }
-    if (now > cursor) {
-        usd += ((now - cursor) / 1000) * (FREE_DAILY_USD / 86400);
-    }
-    return usd;
-}
-
-function settleAccrual(u, now = Date.now()) {
-    const accrued = accrueUsd(u, now);
-    u.accruedUsd = Number(u.accruedUsd || 0) + accrued;
-    u.totalMinedUsd = Number(u.totalMinedUsd || 0) + accrued;
-    u.lastClaimTime = now;
-}
-
-function expireUserPlan(u, now = Date.now()) {
-    settleAccrual(u, now);
-    u.ghs = 0;
-    u.planActive = false;
-    u.planExpiryDate = 0;
-    u.planStartDate = 0;
-}
-
-// ================== DATABASE ==================
+// ================== DATABASE (naya, khali data) ==================
 mongoose.connect(MONGO_URI)
-    .then(async () => {
-        console.log('✅ Connected to MongoDB Atlas Successfully!');
-        try {
-            const currentTime = Date.now();
-            const allUsers = await mongoose.model('User').find({});
-            for (let u of allUsers) {
-                if (u.planActive && u.ghs > 0 && (!u.planStartDate || u.planStartDate === 0)) {
-                    if (u.deposits && Array.isArray(u.deposits)) {
-                        const paidDep = u.deposits.find(d => d.status === 'PAID');
-                        if (paidDep && paidDep.date) {
-                            let parsedTime = Date.parse(paidDep.date);
-                            if (!isNaN(parsedTime)) {
-                                u.planStartDate = parsedTime;
-                                u.planExpiryDate = parsedTime + PLAN_DURATION_MS;
-                                await u.save();
-                            }
-                        }
-                    }
-                }
+    .then(() => console.log('✅ MongoDB connected'))
+    .catch(err => { console.error('❌ MongoDB error:', err.message); process.exit(1); });
 
-                if (u.planActive && u.planExpiryDate && u.planExpiryDate > 0 && currentTime >= u.planExpiryDate) {
-                    expireUserPlan(u, currentTime);
-                    await u.save();
-                }
-            }
-            console.log('✅ All users plans & 10-day plan expiries auto-synced!');
-        } catch (err) {
-            console.log('Auto-sync error:', err);
-        }
-    })
-    .catch(err => console.error('❌ MongoDB Connection Error:', err));
-
-const userSchema = new mongoose.Schema({
+const User = mongoose.model('User', new mongoose.Schema({
     id: { type: String, required: true, unique: true },
     username: { type: String, default: 'User' },
     balance: { type: Number, default: 0 },
-    totalMinedUsd: { type: Number, default: 0 },
-    totalWithdrawnBnb: { type: Number, default: 0 },
-    ghs: { type: Number, default: 0 },
-    lastClaimTime: { type: Number, default: Date.now },
-    accruedUsd: { type: Number, default: 0 },
-    deposits: { type: Array, default: [] },
-    withdrawals: { type: Array, default: [] },
+    lastClaimTime: { type: Number, default: 0 },
+    isVerified: { type: Boolean, default: false },
     isBanned: { type: Boolean, default: false },
-    planActive: { type: Boolean, default: true },
-    planStartDate: { type: Number, default: 0 },
-    planExpiryDate: { type: Number, default: 0 },
+    tasks: { task1: { type: Boolean, default: false }, task2: { type: Boolean, default: false }, task3: { type: Boolean, default: false } },
+    ytStart: { type: Number, default: 0 },
     referredBy: { type: String, default: null },
-    referrals: {
-        level1: { type: Array, default: [] },
-        level2: { type: Array, default: [] },
-        level3: { type: Array, default: [] }
-    },
-    refEarnings: {
-        level1: { type: Number, default: 0 },
-        level2: { type: Number, default: 0 },
-        level3: { type: Number, default: 0 }
-    }
-});
-const User = mongoose.model('User', userSchema);
+    refCredited: { type: Boolean, default: false },
+    referrals: { type: Array, default: [] },
+    totalWithdrawn: { type: Number, default: 0 },
+    withdrawals: { type: Array, default: [] },
+    createdAt: { type: Number, default: Date.now }
+}));
 
-const pendingRequestSchema = new mongoose.Schema({
+const PendingRequest = mongoose.model('PendingRequest', new mongoose.Schema({
     reqId: { type: String, required: true, unique: true },
-    type: { type: String, required: true },
     userId: { type: String, required: true },
-    amount: { type: String, required: true },
-    usdtAmount: { type: Number, default: 1 },
-    coin: { type: String },
-    txHash: { type: String },
-    address: { type: String },
-    status: { type: String, default: 'PENDING' }
-});
-const PendingRequest = mongoose.model('PendingRequest', pendingRequestSchema);
+    amount: { type: Number, required: true },
+    address: { type: String, required: true }
+}));
 
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+// ================== HELPERS ==================
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const wrap = fn => (req, res, next) => fn(req, res, next).catch(e => { console.log('Error:', e); res.status(500).json({ ok: false, error: 'Server error' }); });
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-app.use((req, res, next) => {
-    req.cookies = {};
-    const cookieHeader = req.headers.cookie;
-    if (cookieHeader) {
-        cookieHeader.split(';').forEach(cookie => {
-            const parts = cookie.split('=');
-            req.cookies[parts.shift().trim()] = decodeURIComponent(parts.join('='));
-        });
-    }
-    next();
-});
-
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    if (req.method === 'OPTIONS') return res.sendStatus(204);
-    next();
-});
-
-const activeSessions = new Set();
-
-function checkAdminAuth(req, res, next) {
-    const sessionToken = req.cookies.admin_session;
-    if (sessionToken && activeSessions.has(sessionToken)) {
-        return next();
-    }
-    return res.redirect('/admin/login');
-}
-
-// ================== TELEGRAM HELPERS ==================
-async function sendTelegramMessage(chatId, text, replyMarkup = null) {
+async function tg(method, body) {
     try {
-        let body = { chat_id: chatId, text: text, parse_mode: 'Markdown' };
-        if (replyMarkup) body.reply_markup = replyMarkup;
-        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
+        const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
         });
-    } catch (e) {
-        console.log("Telegram API Error:", e);
+        return await r.json();
+    } catch (e) { console.log('Telegram error:', method, e.message); return { ok: false }; }
+}
+const sendMsg = (chat_id, text, reply_markup, html = true) =>
+    tg('sendMessage', { chat_id, text, reply_markup, ...(html ? { parse_mode: 'HTML' } : {}) });
+
+// Channel membership (bot dono channels me ADMIN hona chahiye)
+async function isMember(channel, userId) {
+    const r = await tg('getChatMember', { chat_id: channel, user_id: Number(userId) });
+    if (!r.ok) return null;
+    const s = r.result.status;
+    return ['member', 'administrator', 'creator'].includes(s) || (s === 'restricted' && r.result.is_member === true);
+}
+async function checkChannels(userId, idxs = [0, 1]) {
+    const joined = [], missing = [];
+    for (const i of idxs) {
+        const m = await isMember(CHANNELS[i].id, userId);
+        if (m === null) return { ok: false, error: 'Channel check failed. Try again later.' };
+        joined.push({ i, joined: m });
+        if (!m) missing.push(CHANNELS[i].name);
     }
+    return { ok: missing.length === 0, missing, joined };
 }
 
-async function sendTelegramPhoto(chatId, photoUrl, caption = '', replyMarkup = null) {
+// Telegram Mini App signature check (fake user ID se koi bypass nahi kar sakta)
+function validateInitData(initData) {
+    if (!initData || initData.length > 4096) return null;
+    const p = new URLSearchParams(initData);
+    const hash = p.get('hash');
+    if (!hash) return null;
+    p.delete('hash');
+    const str = [...p.entries()].map(([k, v]) => `${k}=${v}`).sort().join('\n');
+    const secret = crypto.createHmac('sha256', 'WebAppData').update(BOT_TOKEN).digest();
+    const calc = crypto.createHmac('sha256', secret).update(str).digest('hex');
+    const a = Buffer.from(calc), b = Buffer.from(hash);
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null;
+    if (Date.now() / 1000 - Number(p.get('auth_date') || 0) > 86400) return null;
+    try { return JSON.parse(p.get('user')); } catch (e) { return null; }
+}
+
+function displayName(u) { return u.username ? `@${u.username}` : (u.first_name || 'User'); }
+
+async function auth(req, res, next) {
     try {
-        let body = { chat_id: chatId, photo: photoUrl, caption: caption, parse_mode: 'Markdown' };
-        if (replyMarkup) body.reply_markup = replyMarkup;
-        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendPhoto`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        });
-    } catch (e) {
-        console.log("Telegram Photo Broadcast Error:", e);
-    }
+        const u = validateInitData(req.headers['x-init-data']);
+        if (!u || !u.id) return res.status(401).json({ ok: false, error: 'Please open this app from the AlphaX bot.' });
+        const id = String(u.id);
+        const user = await User.findOneAndUpdate({ id }, { $set: { username: displayName(u) } }, { upsert: true, new: true, setDefaultsOnInsert: true });
+        if (user.isBanned) return res.status(403).json({ ok: false, banned: true, error: 'Your account is banned.' });
+        req.user = user;
+        next();
+    } catch (e) { console.log('Auth error:', e); res.status(500).json({ ok: false, error: 'Server error' }); }
 }
 
-async function editTelegramMessage(chatId, messageId, text, replyMarkup = null) {
-    try {
-        let body = { chat_id: chatId, message_id: messageId, text: text, parse_mode: 'Markdown' };
-        if (replyMarkup) body.reply_markup = replyMarkup;
-        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(body)
-        });
-    } catch (e) {
-        console.log("Telegram Edit Error:", e);
-    }
+function publicUser(u) {
+    return {
+        id: u.id, username: u.username, balance: u.balance, lastClaimTime: u.lastClaimTime, serverTime: Date.now(),
+        isVerified: u.isVerified,
+        tasks: { task1: !!u.tasks.task1, task2: !!u.tasks.task2, task3: !!u.tasks.task3 },
+        referrals: u.referrals, withdrawals: u.withdrawals.slice(0, 50)
+    };
 }
+const fresh = async id => publicUser(await User.findOne({ id }));
 
-async function answerCallbackQuery(callbackQueryId, text) {
-    try {
-        await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ callback_query_id: callbackQueryId, text: text })
-        });
-    } catch (e) {
-        console.log("Callback Answer Error:", e);
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: false, limit: '10kb' }));
+app.use((req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff'); next(); });
+app.use(express.static(path.join(__dirname, 'public')));
+
+// ================== MINI APP API ==================
+app.post('/api/me', auth, wrap(async (req, res) => {
+    let u = req.user;
+    if (u.isVerified) { // har baar check: channel leave kiya to dobara verify
+        const r = await checkChannels(u.id);
+        if (!r.ok && !r.error) { await User.updateOne({ id: u.id }, { isVerified: false }); u = await User.findOne({ id: u.id }); }
     }
-}
+    res.json({ ok: true, data: publicUser(u) });
+}));
 
-setInterval(async () => {
-    try {
-        const currentTime = Date.now();
-        const expiredUsers = await User.find({
-            planActive: true,
-            planExpiryDate: { $gt: 0, $lte: currentTime }
-        });
+app.post('/api/verify', auth, wrap(async (req, res) => {
+    const u = req.user;
+    const r = await checkChannels(u.id);
+    if (r.error) return res.json({ ok: false, error: r.error });
+    if (!r.ok) return res.json({ ok: false, missing: r.missing, joined: r.joined });
+    await User.updateOne({ id: u.id }, { isVerified: true });
 
-        for (let u of expiredUsers) {
-            expireUserPlan(u, currentTime);
-            await u.save();
-
-            sendTelegramMessage(
-                u.id,
-                `❌ *Plan Expired:* Your plan was expired plzz renew plan agin 🚀`
-            );
-        }
-    } catch (err) {
-        console.log("Background Plan Expiry Error:", err);
-    }
-}, 5 * 60 * 1000);
-
-function getPlanDaysFormat(user) {
-    if (!user.planActive || user.ghs <= 0) {
-        return "N/A";
-    }
-
-    let startTimestamp = user.planStartDate;
-    if (!startTimestamp || startTimestamp === 0) {
-        if (user.deposits && Array.isArray(user.deposits)) {
-            const paidDep = user.deposits.find(d => d.status === 'PAID');
-            if (paidDep && paidDep.date) {
-                let parsedTime = Date.parse(paidDep.date);
-                if (!isNaN(parsedTime)) {
-                    startTimestamp = parsedTime;
-                }
-            }
-        }
-    }
-    if (!startTimestamp || startTimestamp === 0) {
-        startTimestamp = Date.now();
-    }
-
-    const now = Date.now();
-    const elapsed = now - startTimestamp;
-    let daysPassed = Math.floor(elapsed / (1000 * 60 * 60 * 24)) + 1;
-    if (daysPassed > 10) daysPassed = 10;
-    if (daysPassed < 1) daysPassed = 1;
-
-    return `${daysPassed}/10 Days`;
-}
-
-function setRequestStatus(list, reqId, pendingNames, newStatus) {
-    let idx = list.findIndex(x => String(x.id) === String(reqId));
-    if (idx !== -1) {
-        list[idx].status = newStatus;
-    } else {
-        let p = list.find(x => pendingNames.includes(x.status));
-        if (p) p.status = newStatus;
-    }
-}
-
-async function payReferralCommissions(depositUser, usdtAmount) {
-    const rates = [0.15, 0.03, 0.01];
-    let current = depositUser;
-    const bnbPrice = await getBnbPrice();
-    const depositingUserId = depositUser.id;
-
-    for (let lvl = 1; lvl <= 3; lvl++) {
-        if (!current.referredBy) break;
-        const refUser = await User.findOne({ id: current.referredBy });
-        if (!refUser) break;
-
-        const commUsdt = usdtAmount * rates[lvl - 1];
-        const commBnb = commUsdt / bnbPrice;
-
-        refUser.balance += commBnb;
-        refUser.refEarnings[`level${lvl}`] = (refUser.refEarnings[`level${lvl}`] || 0) + commBnb;
-        refUser.markModified('refEarnings');
-
-        if (!refUser.referrals[`level${lvl}`]) {
-            refUser.referrals[`level${lvl}`] = [];
-        }
-        
-        let refList = refUser.referrals[`level${lvl}`];
-        let existingRefIndex = refList.findIndex(r => (typeof r === 'string' ? r === depositingUserId : r.id === depositingUserId));
-
-        if (existingRefIndex !== -1) {
-            if (typeof refList[existingRefIndex] === 'string') {
-                refList[existingRefIndex] = {
-                    id: depositingUserId,
-                    joinedDate: 'Active',
-                    bonusEarned: commBnb
-                };
-            } else {
-                refList[existingRefIndex].bonusEarned = (Number(refList[existingRefIndex].bonusEarned) || 0) + commBnb;
-            }
-        } else {
-            refList.push({
-                id: depositingUserId,
-                joinedDate: 'Active',
-                bonusEarned: commBnb
+    // 1 level referral: friend verify kare tabhi referrer ko 500 SHIBA (ek hi baar)
+    if (u.referredBy && !u.refCredited) {
+        const claimed = await User.findOneAndUpdate({ id: u.id, refCredited: false }, { refCredited: true });
+        if (claimed) {
+            const ref = await User.findOneAndUpdate({ id: u.referredBy }, {
+                $inc: { balance: REF_BONUS },
+                $push: { referrals: { id: u.id, date: new Date().toISOString(), bonus: REF_BONUS } }
             });
+            if (ref) sendMsg(ref.id, `🎁 <b>New referral joined!</b>\nUser ID: <code>${esc(u.id)}</code>\n+${REF_BONUS} SHIBA added to your balance.`);
         }
-        refUser.markModified(`referrals.level${lvl}`);
-
-        await refUser.save();
-
-        sendTelegramMessage(
-            refUser.id, 
-            `🎁 Received +${commBnb.toFixed(4)} BNB ($${commUsdt.toFixed(2)} USDT) (${rates[lvl - 1] * 100}% Level ${lvl} Referral Commission)!`
-        );
-        
-        current = refUser;
     }
-}
+    res.json({ ok: true, data: await fresh(u.id) });
+}));
 
-async function approveRequest(reqDoc, u, reqId) {
-    if (reqDoc.type === 'deposit' && u) {
-        const depAmount = reqDoc.usdtAmount ? Number(reqDoc.usdtAmount) : 1;
+app.post('/api/claim', auth, wrap(async (req, res) => {
+    if (!req.user.isVerified) return res.json({ ok: false, error: 'Please verify channels first.' });
+    const now = Date.now();
+    const u = await User.findOneAndUpdate(
+        { id: req.user.id, lastClaimTime: { $lte: now - COOLDOWN } },
+        { $inc: { balance: DAILY }, $set: { lastClaimTime: now } }, { new: true });
+    if (!u) return res.json({ ok: false, error: 'Not ready yet. Come back later.' });
+    res.json({ ok: true, data: publicUser(u) });
+}));
 
-        setRequestStatus(u.deposits, reqId, ['PENDING'], 'PAID');
-        u.markModified('deposits');
+app.post('/api/task/start', auth, wrap(async (req, res) => {
+    await User.updateOne({ id: req.user.id }, { ytStart: Date.now() });
+    res.json({ ok: true });
+}));
 
-        const now = Date.now();
-        settleAccrual(u, now);
-
-        const hadPaidPlan = isPaidPlanActive(u, now);
-        u.ghs = hadPaidPlan ? Number(u.ghs) + depAmount : depAmount;
-        u.planActive = true;
-        u.planStartDate = now;
-        u.planExpiryDate = now + PLAN_DURATION_MS;
-
-        await u.save();
-        await payReferralCommissions(u, depAmount);
-
-        sendTelegramMessage(reqDoc.userId, `✅ Your deposit of ${reqDoc.amount} has been approved!\n⚡ +${depAmount} GHS Mining Power added (Valid for 10 Days).\n⛏️ Mining is now active. Collect your profit anytime from the app.`);
-    } else if (reqDoc.type === 'withdraw' && u) {
-        setRequestStatus(u.withdrawals, reqId, ['PENDING', 'PEND1NG'], 'PAID');
-        u.totalWithdrawnBnb = Number(u.totalWithdrawnBnb || 0) + parseFloat(reqDoc.amount || 0);
-        u.markModified('withdrawals');
-        await u.save();
-        sendTelegramMessage(reqDoc.userId, `✅ Your withdrawal of ${reqDoc.amount} BNB has been approved!`);
+app.post('/api/task', auth, wrap(async (req, res) => {
+    const id = Number(req.body.taskId);
+    if (![1, 2, 3].includes(id)) return res.json({ ok: false, error: 'Invalid task' });
+    const u = req.user;
+    if (!u.isVerified) return res.json({ ok: false, error: 'Please verify channels first.' });
+    if (id === 3) {
+        if (!u.ytStart || Date.now() - u.ytStart < YT_WAIT) return res.json({ ok: false, error: 'Pehle YouTube kholo aur thodi der ruko, phir Check karo.' });
+    } else {
+        const r = await checkChannels(u.id, [id - 1]);
+        if (r.error) return res.json({ ok: false, error: r.error });
+        if (!r.ok) return res.json({ ok: false, error: 'Pehle channel join karo!' });
     }
-}
+    const key = `tasks.task${id}`;
+    const done = await User.findOneAndUpdate({ id: u.id, [key]: false }, { $set: { [key]: true }, $inc: { balance: TASK_REWARD } }, { new: true });
+    if (!done) return res.json({ ok: false, error: 'Task already claimed.' });
+    res.json({ ok: true, data: publicUser(done) });
+}));
 
-async function rejectRequest(reqDoc, u, reqId) {
-    if (reqDoc.type === 'deposit' && u) {
-        setRequestStatus(u.deposits, reqId, ['PENDING'], 'DECLINED');
-        u.markModified('deposits');
-        await u.save();
-        sendTelegramMessage(reqDoc.userId, `❌ Your deposit request was declined.`);
-    } else if (reqDoc.type === 'withdraw' && u) {
-        u.balance += parseFloat(reqDoc.amount);
-        setRequestStatus(u.withdrawals, reqId, ['PENDING', 'PEND1NG'], 'DECLINED');
-        u.markModified('withdrawals');
-        await u.save();
-        sendTelegramMessage(reqDoc.userId, `❌ Your withdrawal request was declined and funds refunded.`);
+app.post('/api/withdraw', auth, wrap(async (req, res) => {
+    const u = req.user;
+    const amt = Math.floor(Number(req.body.amount));
+    const address = String(req.body.address || '').trim();
+    if (!u.isVerified) return res.json({ ok: false, error: 'Please verify channels first.' });
+    if (!/^0x[a-fA-F0-9]{40}$/.test(address)) return res.json({ ok: false, error: 'Invalid BEP-20 wallet address!' });
+    if (!Number.isFinite(amt) || amt < MIN_WITHDRAW) return res.json({ ok: false, error: `Minimum withdrawal is ${MIN_WITHDRAW} SHIBA!` });
+    if (await PendingRequest.findOne({ userId: u.id })) return res.json({ ok: false, error: 'Aapki ek withdrawal request pehle se pending hai.' });
+
+    const reqId = 'wd_' + crypto.randomBytes(6).toString('hex');
+    const upd = await User.findOneAndUpdate({ id: u.id, balance: { $gte: amt } }, {
+        $inc: { balance: -amt },
+        $push: { withdrawals: { $each: [{ id: reqId, amount: amt, address, status: 'PENDING', date: new Date().toISOString() }], $position: 0 } }
+    }, { new: true });
+    if (!upd) return res.json({ ok: false, error: 'Insufficient balance!' });
+
+    await PendingRequest.create({ reqId, userId: u.id, amount: amt, address });
+    sendMsg(ADMIN_ID, `📤 <b>New Withdraw Request</b>\n\n👤 User ID: <code>${esc(u.id)}</code>\n💰 Amount: <b>${amt} SHIBA</b>\n🏦 Address: <code>${esc(address)}</code>`, {
+        inline_keyboard: [[{ text: '✅ Approve', callback_data: `approve_${reqId}` }, { text: '❌ Reject', callback_data: `reject_${reqId}` }]]
+    });
+    res.json({ ok: true, data: publicUser(upd) });
+}));
+
+// ================== REQUEST APPROVE / REJECT ==================
+async function processRequest(reqId, action) {
+    const r = await PendingRequest.findOneAndDelete({ reqId });
+    if (!r) return null;
+    const af = { arrayFilters: [{ 'w.id': reqId }] };
+    if (action === 'approve') {
+        await User.updateOne({ id: r.userId }, { $set: { 'withdrawals.$[w].status': 'PAID' }, $inc: { totalWithdrawn: r.amount } }, af);
+        sendMsg(r.userId, `✅ Your withdrawal of <b>${r.amount} SHIBA</b> has been approved and paid!`);
+    } else {
+        await User.updateOne({ id: r.userId }, { $set: { 'withdrawals.$[w].status': 'DECLINED' }, $inc: { balance: r.amount } }, af);
+        sendMsg(r.userId, `❌ Your withdrawal of <b>${r.amount} SHIBA</b> was declined and the amount was refunded.`);
     }
+    return r;
 }
 
 // ================== TELEGRAM WEBHOOK ==================
-async function handleWebhookLogic(req, res) {
-    const update = req.body;
+app.post('/api/webhook', async (req, res) => {
+    if (req.headers['x-telegram-bot-api-secret-token'] !== WEBHOOK_SECRET) return res.sendStatus(403);
     res.sendStatus(200);
-
     try {
-        if (update.message) {
-            const msg = update.message;
-            const chatId = String(msg.chat.id);
-            const text = msg.text || '';
-
-            let user = await User.findOne({ id: chatId });
-            if (user && user.isBanned) {
-                await sendTelegramMessage(chatId, "⚠️ *Access Denied:* Your account has been banned by the admin.");
-                return;
-            }
+        const update = req.body;
+        if (update.message && update.message.text !== undefined) {
+            const msg = update.message, chatId = String(msg.chat.id), text = msg.text || '';
+            if (msg.chat.type !== 'private') return;
+            const known = await User.findOne({ id: chatId });
+            if (known && known.isBanned) return sendMsg(chatId, '⚠️ <b>Access Denied:</b> Your account has been banned.');
 
             if (text.startsWith('/start')) {
-                let referrerId = null;
-                const match = text.match(/\/start\s+(\d+)/);
-                if (match && match[1]) {
-                    referrerId = String(match[1]).trim();
-                }
+                const m = text.match(/^\/start\s+(\d{1,20})$/);
+                let referrer = m ? m[1] : null;
+                if (referrer === chatId) referrer = null;
+                if (referrer && !(await User.exists({ id: referrer }))) referrer = null;
+                const name = displayName(msg.from);
+                const user = await User.findOneAndUpdate({ id: chatId }, { $set: { username: name } }, { upsert: true, new: true, setDefaultsOnInsert: true });
+                // referrer sirf naye user (jo abhi verify nahi hua) ke liye set hota hai
+                if (referrer && !user.referredBy && !user.isVerified) await User.updateOne({ id: chatId, referredBy: null }, { referredBy: referrer });
 
-                let isNewUser = false;
-
-                if (!user) {
-                    isNewUser = true;
-                    user = new User({
-                        id: chatId,
-                        username: msg.from.username ? `@${msg.from.username}` : (msg.from.first_name || 'User'),
-                        referredBy: (referrerId && referrerId !== chatId) ? referrerId : null
-                    });
-                    await user.save();
-                } else {
-                    let currentUsername = msg.from.username ? `@${msg.from.username}` : (msg.from.first_name || 'User');
-                    if (user.username !== currentUsername) {
-                        user.username = currentUsername;
-                        await user.save();
-                    }
-                    if (!user.referredBy && referrerId && referrerId !== chatId) {
-                        user.referredBy = referrerId;
-                        await user.save();
-                        isNewUser = true;
-                    }
-                }
-
-                if (isNewUser && user.referredBy) {
-                    const l1Id = user.referredBy;
-                    let refL1User = await User.findOne({ id: l1Id });
-                    if (refL1User) {
-                        let exists = refL1User.referrals.level1.some(r => (typeof r === 'string' ? r === chatId : r.id === chatId));
-                        if (!exists) {
-                            refL1User.referrals.level1.push({ id: chatId, joinedDate: 'Active', bonusEarned: 0 });
-                            refL1User.markModified('referrals.level1');
-                            await refL1User.save();
-                        }
-                    }
-                    sendTelegramMessage(l1Id, `🎁 *New Level 1 Referral Joined!*\nUser ID: \`${chatId}\``);
-
-                    const refL1 = await User.findOne({ id: l1Id });
-                    if (refL1 && refL1.referredBy) {
-                        const l2Id = refL1.referredBy;
-                        let refL2User = await User.findOne({ id: l2Id });
-                        if (refL2User) {
-                            let existsL2 = refL2User.referrals.level2.some(r => (typeof r === 'string' ? r === chatId : r.id === chatId));
-                            if (!existsL2) {
-                                refL2User.referrals.level2.push({ id: chatId, joinedDate: 'Active', bonusEarned: 0 });
-                                refL2User.markModified('referrals.level2');
-                                await refL2User.save();
-                            }
-                        }
-
-                        const refL2 = await User.findOne({ id: l2Id });
-                        if (refL2 && refL2.referredBy) {
-                            const l3Id = refL2.referredBy;
-                            let refL3User = await User.findOne({ id: l3Id });
-                            if (refL3User) {
-                                let existsL3 = refL3User.referrals.level3.some(r => (typeof r === 'string' ? r === chatId : r.id === chatId));
-                                if (!existsL3) {
-                                    refL3User.referrals.level3.push({ id: chatId, joinedDate: 'Active', bonusEarned: 0 });
-                                    refL3User.markModified('referrals.level3');
-                                    await refL3User.save();
-                                }
-                            }
-                        }
-                    }
-                }
-
-                const welcomeCaption =
-`🎉 *Welcome to BNB Smart Miner!*
-
-⛏️ _Mine BNB, invite friends & earn rewards._ 💰 _Grow your earnings and withdraw directly to your wallet!_`;
-
-                const startPhotoUrl = "https://i.ibb.co/jk5thdjj/file-000000003e3481f49aa5f2b114415564.png";
-
-                const webAppMarkup = {
-                    inline_keyboard: [
-                        [{ text: "📢 Join Official Channel", url: "https://t.me/Bnbsmartminer1" }],
-                        [{ text: "💸 Join Payment Channel", url: "https://t.me/paymentschanel12" }]
-                    ]
-                };
-
-                await sendTelegramPhoto(chatId, startPhotoUrl, welcomeCaption, webAppMarkup);
-
-            } else if (text === '/admin' && chatId === String(ADMIN_ID)) {
-                const renderAppUrl = process.env.RENDER_EXTERNAL_URL || "https://dashboard.render.com";
-                await sendTelegramMessage(chatId, `👑 **BNB Smart Miner Admin Access**\n\nClick below to open Login Page:`, {
-                    inline_keyboard: [[ { text: "🔐 Admin Login Panel", url: `${renderAppUrl}/admin/login` } ]]
-                });
+                const kb = [];
+                if (PUBLIC_URL.startsWith('https://')) kb.push([{ text: '🚀 Open AlphaX', web_app: { url: PUBLIC_URL } }]);
+                kb.push([{ text: '📢 Join Channel 1', url: 'https://t.me/paymentchanneluta' }, { text: '📢 Join Channel 2', url: 'https://t.me/updatechanneluta' }]);
+                await sendMsg(chatId, `🔥 <b>Welcome to AlphaX!</b>\n\n⛏️ Claim <b>1000 SHIBA</b> free every 24 hours.\n🎁 Complete tasks and invite friends to earn <b>500 SHIBA</b> each.\n\n👇 Tap below to start.`, { inline_keyboard: kb });
+            } else if (text === '/admin' && chatId === ADMIN_ID) {
+                await sendMsg(chatId, '👑 <b>AlphaX Admin</b>', PUBLIC_URL ? { inline_keyboard: [[{ text: '🔐 Admin Login Panel', url: `${PUBLIC_URL}/admin/login` }]] } : undefined);
             }
         } else if (update.callback_query) {
-            const query = update.callback_query;
-            const chatId = String(query.message.chat.id);
-            const data = query.data;
-            const messageId = query.message.message_id;
-
-            let userCheck = await User.findOne({ id: chatId });
-            if (userCheck && userCheck.isBanned) {
-                return answerCallbackQuery(query.id, "⚠️ Your account is banned!");
-            }
-
-            if (data.startsWith('approve_') || data.startsWith('reject_')) {
-                if (chatId !== String(ADMIN_ID)) return answerCallbackQuery(query.id, "Unauthorized!");
-
-                const isApprove = data.startsWith('approve_');
-                const reqId = data.replace(isApprove ? 'approve_' : 'reject_', '');
-
-                const reqDoc = await PendingRequest.findOneAndDelete({ reqId });
-                if (!reqDoc) return answerCallbackQuery(query.id, "Request already handled!");
-
-                const u = await User.findOne({ id: reqDoc.userId });
-
-                if (isApprove) {
-                    await approveRequest(reqDoc, u, reqId);
-                    editTelegramMessage(chatId, messageId, `✅ **Request Approved**\nUser ID: ${reqDoc.userId}\nAmount:${reqDoc.amount}`);
-                } else {
-                    await rejectRequest(reqDoc, u, reqId);
-                    editTelegramMessage(chatId, messageId, `❌ **Request Rejected**\nUser ID: ${reqDoc.userId}\nAmount:${reqDoc.amount}`);
-                }
-
-                answerCallbackQuery(query.id, "Done!");
-            }
+            const q = update.callback_query, chatId = String(q.message.chat.id), data = q.data || '';
+            const m = data.match(/^(approve|reject)_(wd_[a-f0-9]+)$/);
+            if (!m) return;
+            if (chatId !== ADMIN_ID) return tg('answerCallbackQuery', { callback_query_id: q.id, text: 'Unauthorized!' });
+            const r = await processRequest(m[2], m[1]);
+            if (!r) return tg('answerCallbackQuery', { callback_query_id: q.id, text: 'Already handled!' });
+            tg('editMessageText', { chat_id: chatId, message_id: q.message.message_id, parse_mode: 'HTML',
+                text: `${m[1] === 'approve' ? '✅ <b>Approved</b>' : '❌ <b>Rejected</b>'}\nUser ID: ${esc(r.userId)}\nAmount: ${r.amount} SHIBA` });
+            tg('answerCallbackQuery', { callback_query_id: q.id, text: 'Done!' });
         }
-    } catch (err) {
-        console.log("Webhook error:", err);
-    }
-}
-
-app.post(`/api/webhook/${BOT_TOKEN}`, handleWebhookLogic);
-app.post('/webhook', handleWebhookLogic);
-app.post('/api/webhook/*', handleWebhookLogic);
-
-app.get('/', (req, res) => {
-    res.send(`<h1>BNB Smart Miner Backend Active</h1><p>Please launch via Telegram Bot.</p>`);
+    } catch (e) { console.log('Webhook error:', e); }
 });
 
 // ================== ADMIN PANEL ==================
+const sessions = new Map();
+const attempts = new Map();
+const parseCookies = h => Object.fromEntries((h || '').split(';').map(c => c.trim().split('=')).filter(p => p[0]).map(p => [p[0], decodeURIComponent(p.slice(1).join('='))]));
+const safeEq = (a, b) => { const x = crypto.createHash('sha256').update(String(a)).digest(), y = crypto.createHash('sha256').update(String(b)).digest(); return crypto.timingSafeEqual(x, y); };
+
+function checkAdmin(req, res, next) {
+    const t = parseCookies(req.headers.cookie).admin_session;
+    if (t && sessions.has(t) && sessions.get(t) > Date.now()) return next();
+    if (req.method === 'GET') return res.redirect('/admin/login');
+    return res.status(401).json({ ok: false, message: 'Not logged in' });
+}
+
 app.get('/admin/login', (req, res) => {
-    res.send(`
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>Admin Login - BNB Smart Miner</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <style>
-                * { box-sizing: border-box; font-family: 'Segoe UI', sans-serif; }
-                body { background: #0c0a09; color: #fff; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
-                .login-card { background: #1c1917; border: 1px solid #292524; padding: 30px; border-radius: 16px; width: 90%; max-width: 360px; text-align: center; }
-                h2 { color: #38bdf8; margin-bottom: 20px; }
-                input { width: 100%; padding: 12px; margin-bottom: 12px; background: #0c0a09; border: 1px solid #44403c; color: #fff; border-radius: 8px; }
-                button { width: 100%; padding: 12px; background: #38bdf8; color: #000; font-weight: bold; border: none; border-radius: 8px; cursor: pointer; }
-            </style>
-        </head>
-        <body>
-            <div class="login-card">
-                <h2>🔐 Admin Login</h2>
-                <form action="/admin/login" method="POST">
-                    <input type="text" name="username" placeholder="Username" required>
-                    <input type="password" name="password" placeholder="Password" required>
-                    <button type="submit">Login</button>
-                </form>
-            </div>
-        </body>
-        </html>
-    `);
+    res.send(`<!DOCTYPE html><html><head><title>Admin Login</title><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>*{box-sizing:border-box;font-family:'Segoe UI',sans-serif}body{background:#0c0a09;color:#fff;display:flex;justify-content:center;align-items:center;height:100vh;margin:0}.c{background:#1c1917;border:1px solid #292524;padding:30px;border-radius:16px;width:90%;max-width:360px;text-align:center}h2{color:#f5a623}input{width:100%;padding:12px;margin-bottom:12px;background:#0c0a09;border:1px solid #44403c;color:#fff;border-radius:8px}button{width:100%;padding:12px;background:#f5a623;color:#000;font-weight:bold;border:none;border-radius:8px;cursor:pointer}</style></head>
+<body><div class="c"><h2>🔐 AlphaX Admin</h2><form action="/admin/login" method="POST"><input name="username" placeholder="Username" required><input type="password" name="password" placeholder="Password" required><button>Login</button></form></div></body></html>`);
 });
 
 app.post('/admin/login', (req, res) => {
-    const { username, password } = req.body;
-    if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
-        const sessionToken = "token_" + Math.random().toString(36).substring(2) + Date.now();
-        activeSessions.add(sessionToken);
-
-        res.setHeader('Set-Cookie', `admin_session=${sessionToken}; Path=/; HttpOnly; Max-Age=86400; SameSite=Lax`);
+    const ip = req.ip, a = attempts.get(ip) || { n: 0, t: Date.now() };
+    if (Date.now() - a.t > 15 * 60 * 1000) { a.n = 0; a.t = Date.now(); }
+    if (a.n >= 5) return res.status(429).send('Too many attempts. Try again in 15 minutes.');
+    const { username = '', password = '' } = req.body;
+    if (safeEq(username, ADMIN_USERNAME) && safeEq(password, ADMIN_PASSWORD)) {
+        attempts.delete(ip);
+        const token = crypto.randomBytes(32).toString('hex');
+        sessions.set(token, Date.now() + 24 * 3600 * 1000);
+        res.setHeader('Set-Cookie', `admin_session=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=86400${PUBLIC_URL.startsWith('https') ? '; Secure' : ''}`);
         return res.redirect('/admin/dashboard');
     }
-    res.send(`<script>alert('Invalid Credentials!'); window.location.href='/admin/login';</script>`);
+    a.n++; attempts.set(ip, a);
+    res.send(`<script>alert('Invalid Credentials!');location.href='/admin/login'</script>`);
 });
 
 app.get('/admin/logout', (req, res) => {
-    const sessionToken = req.cookies.admin_session;
-    if (sessionToken) activeSessions.delete(sessionToken);
+    const t = parseCookies(req.headers.cookie).admin_session; if (t) sessions.delete(t);
     res.setHeader('Set-Cookie', 'admin_session=; Path=/; HttpOnly; Max-Age=0');
     res.redirect('/admin/login');
 });
 
-app.get('/admin/dashboard', checkAdminAuth, async (req, res) => {
-    const requests = await PendingRequest.find({});
-    const totalUsers = await User.countDocuments();
-    const allUsers = await User.find({});
-    const liveBnbPrice = await getBnbPrice();
+app.get('/admin/dashboard', checkAdmin, wrap(async (req, res) => {
+    const [totalUsers, verified, pending, agg] = await Promise.all([
+        User.countDocuments(), User.countDocuments({ isVerified: true }), PendingRequest.find({}).sort({ _id: -1 }),
+        User.aggregate([{ $group: { _id: null, bal: { $sum: '$balance' }, paid: { $sum: '$totalWithdrawn' } } }])
+    ]);
+    const s = agg[0] || { bal: 0, paid: 0 };
+    const q = String(req.query.search || '').trim().slice(0, 64);
+    const found = q ? await User.findOne({ $or: [{ id: q }, { username: q.startsWith('@') ? q : '@' + q }] }) : null;
 
-    let totalPaidOut = 0;
-    let totalGlobalDepositUsdt = 0;
-    let activeDepositUsersCount = 0;
-    let activeDepositUsersList = [];
+    const reqRows = pending.map(r => `<tr><td>${esc(r.userId)}</td><td><b>${r.amount} SHIBA</b></td><td><code>${esc(r.address)}</code></td>
+<td><button class="b g" data-act="req" data-do="approve" data-id="${esc(r.reqId)}">Approve</button> <button class="b r" data-act="req" data-do="reject" data-id="${esc(r.reqId)}">Reject</button></td></tr>`).join('');
 
-    allUsers.forEach(u => {
-        let userActualDepositSum = 0;
-        if (u.deposits) {
-            u.deposits.forEach(d => {
-                if (d.status === 'PAID') {
-                    let depUsdtVal = parseFloat(d.usdtAmount || 1);
-                    userActualDepositSum += depUsdtVal;
-                    totalGlobalDepositUsdt += depUsdtVal;
-                }
-            });
-        }
+    const userBox = found ? `<div class="box">
+<p>👤 <b>${esc(found.username)}</b> | ID: <code>${esc(found.id)}</code></p>
+<p>💰 Balance: <b>${found.balance} SHIBA</b> | 📤 Total Withdrawn: <b>${found.totalWithdrawn}</b></p>
+<p>✅ Verified: ${found.isVerified ? 'Yes' : 'No'} | 🚫 Banned: ${found.isBanned ? 'Yes' : 'No'} | 👥 Referrals: ${found.referrals.length} | Referred by: ${esc(found.referredBy || 'Direct')}</p>
+<div class="row"><input type="number" id="amt" placeholder="Amount">
+<button class="b g" data-act="bal" data-do="add" data-uid="${esc(found.id)}">+ Add</button>
+<button class="b r" data-act="bal" data-do="cut" data-uid="${esc(found.id)}">- Cut</button>
+<button class="b r" data-act="ban" data-do="ban" data-uid="${esc(found.id)}">Ban</button>
+<button class="b g" data-act="ban" data-do="unban" data-uid="${esc(found.id)}">Unban</button></div>
+<div class="row"><input id="smsg" placeholder="Message to this user"><button class="b" data-act="msg" data-uid="${esc(found.id)}">Send</button></div></div>` : (q ? '<p style="color:#ef4444">User not found!</p>' : '');
 
-        if (userActualDepositSum >= 1 && u.planActive !== false) {
-            activeDepositUsersCount++;
-            activeDepositUsersList.push(u);
-        }
+    res.send(`<!DOCTYPE html><html><head><title>AlphaX Admin</title><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<style>*{box-sizing:border-box;font-family:'Segoe UI',sans-serif}body{background:#0c0a09;color:#f3f4f6;margin:0;padding:16px}h1{color:#f5a623;font-size:22px;margin:0}.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+.lo{background:#ef4444;color:#fff;padding:6px 12px;border-radius:6px;text-decoration:none;font-size:12px;font-weight:bold}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:16px}
+.st{background:#1c1917;border:1px solid #292524;border-radius:12px;padding:14px}.st small{color:#a8a29e;font-size:11px;text-transform:uppercase}.st div{font-size:19px;font-weight:bold;color:#f5a623;margin-top:6px}
+.card{background:#1c1917;border:1px solid #292524;border-radius:12px;padding:16px;margin-bottom:16px}.card h3{color:#f5a623;margin:0 0 10px;font-size:15px}
+input,textarea{background:#0c0a09;border:1px solid #44403c;color:#fff;padding:10px;border-radius:8px;width:100%;font-size:14px}.row{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}.row input{flex:1;min-width:120px}
+.b{background:#f5a623;color:#000;border:none;font-weight:bold;padding:9px 14px;border-radius:8px;cursor:pointer}.b.g{background:#22c55e;color:#fff}.b.r{background:#ef4444;color:#fff}
+table{width:100%;border-collapse:collapse}th,td{padding:8px;text-align:left;border-bottom:1px solid #292524;font-size:12px;word-break:break-all}th{color:#a8a29e}.box{background:#0c0a09;padding:12px;border-radius:8px;border:1px solid #292524;margin-top:10px;font-size:13px;line-height:1.8}</style></head><body>
+<div class="top"><h1>👑 AlphaX Admin</h1><a class="lo" href="/admin/logout">Logout</a></div>
+<div class="grid"><div class="st"><small>Total Users</small><div>${totalUsers}</div></div><div class="st"><small>Verified Users</small><div>${verified}</div></div>
+<div class="st"><small>Users' Balance</small><div>${Math.floor(s.bal)} SHIBA</div></div><div class="st"><small>Paid Out</small><div>${Math.floor(s.paid)} SHIBA</div></div>
+<div class="st"><small>Pending Requests</small><div>${pending.length}</div></div></div>
+<div class="card"><h3>⏳ Pending Withdrawal Requests</h3>${pending.length ? `<table><tr><th>User ID</th><th>Amount</th><th>Wallet</th><th>Action</th></tr>${reqRows}</table>` : '<p style="color:#a8a29e;font-size:12px">No pending requests.</p>'}</div>
+<div class="card"><h3>🔍 Search & Manage User</h3><form method="GET" class="row"><input name="search" placeholder="Telegram ID or @username" value="${esc(q)}"><button class="b">Search</button></form>${userBox}</div>
+<div class="card"><h3>📢 Broadcast</h3><textarea id="bc" rows="3" placeholder="Message to all users..."></textarea><button class="b" style="margin-top:10px;width:100%" data-act="bc">Send Broadcast</button></div>
+<script>
+async function post(u,b){const r=await fetch(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});const d=await r.json();alert(d.message||'Done');return d}
+document.addEventListener('click',async e=>{const b=e.target.closest('[data-act]');if(!b)return;const a=b.dataset.act;let d;
+if(a==='req')d=await post('/admin/action',{reqId:b.dataset.id,action:b.dataset.do});
+else if(a==='bal'){const amount=document.getElementById('amt').value;if(!amount)return alert('Enter amount');d=await post('/admin/balance',{userId:b.dataset.uid,amount,action:b.dataset.do})}
+else if(a==='ban')d=await post('/admin/ban',{userId:b.dataset.uid,action:b.dataset.do});
+else if(a==='msg'){const message=document.getElementById('smsg').value;if(!message)return;d=await post('/admin/msg',{userId:b.dataset.uid,message})}
+else if(a==='bc'){const message=document.getElementById('bc').value;if(!message)return;if(!confirm('Send to all users?'))return;d=await post('/admin/broadcast',{message})}
+if(a!=='msg'&&a!=='bc')location.reload()});
+</script></body></html>`);
+}));
 
-        if (u.withdrawals) {
-            u.withdrawals.forEach(w => {
-                if (w.status === 'PAID') totalPaidOut += parseFloat(w.amount || 0);
-            });
-        }
-    });
-
-    let totalGlobalDepositBnb = totalGlobalDepositUsdt / liveBnbPrice;
-
-    let searchId = req.query.search ? req.query.search.trim() : '';
-    let searchedUser = null;
-    let userTotalDepositUsdt = 0;
-    let userTotalWithdrawBnb = 0;
-    let userPaidWithdrawCount = 0;
-    let totalRefEarn = 0;
-
-    if (searchId) {
-        searchedUser = await User.findOne({
-            $or: [{ id: searchId }, { username: searchId.replace('@', '') }]
-        });
-
-        if (searchedUser) {
-            if (searchedUser.deposits) {
-                searchedUser.deposits.forEach(d => {
-                    if (d.status === 'PAID') {
-                        userTotalDepositUsdt += parseFloat(d.usdtAmount || 1);
-                    }
-                });
-            }
-            if (searchedUser.withdrawals) {
-                searchedUser.withdrawals.forEach(w => {
-                    if (w.status === 'PAID') {
-                        userTotalWithdrawBnb += parseFloat(w.amount || 0);
-                        userPaidWithdrawCount++;
-                    }
-                });
-            }
-            let l1Earn = searchedUser.refEarnings?.level1 || 0;
-            let l2Earn = searchedUser.refEarnings?.level2 || 0;
-            let l3Earn = searchedUser.refEarnings?.level3 || 0;
-            totalRefEarn = l1Earn + l2Earn + l3Earn;
-        }
-    }
-
-    let html = `
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>BNB Smart Miner Admin Panel</title>
-            <meta name="viewport" content="width=device-width, initial-scale=1.0">
-            <style>
-                * { box-sizing: border-box; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; }
-                body { background: #0c0a09; color: #f3f4f6; margin: 0; padding: 20px; }
-                .header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
-                .header h1 { color: #38bdf8; margin: 0; font-size: 24px; }
-                .logout-btn { background: #ef4444; color: #fff; padding: 6px 12px; border-radius: 6px; text-decoration: none; font-size: 12px; font-weight: bold; }
-                .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; margin-bottom: 20px; }
-                .stat-card { background: #1c1917; border: 1px solid #292524; border-radius: 12px; padding: 15px; text-align: left; }
-                .stat-title { font-size: 11px; color: #a8a29e; text-transform: uppercase; letter-spacing: 0.5px; }
-                .stat-value { font-size: 20px; font-weight: bold; color: #38bdf8; margin-top: 6px; }
-                .nav-tabs { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; background: #1c1917; padding: 10px; border-radius: 12px; border: 1px solid #292524; }
-                .nav-tab { background: #292524; color: #a8a29e; padding: 8px 16px; border-radius: 8px; text-decoration: none; font-size: 13px; font-weight: bold; cursor: pointer; transition: 0.2s; }
-                .nav-tab.active { background: #38bdf8; color: #000; }
-                .tab-content { display: none; }
-                .tab-content.active { display: block; }
-                .card { background: #1c1917; border: 1px solid #292524; border-radius: 12px; padding: 18px; margin-bottom: 20px; }
-                .card h3 { color: #38bdf8; margin-top: 0; font-size: 16px; border-bottom: 1px solid #292524; padding-bottom: 8px; }
-                .search-box { display: flex; gap: 10px; margin-bottom: 15px; }
-                input, textarea { background: #0c0a09; border: 1px solid #44403c; color: #fff; padding: 10px; border-radius: 8px; width: 100%; font-size: 14px; }
-                .btn { background: #38bdf8; color: #000; border: none; font-weight: bold; padding: 10px 18px; border-radius: 8px; cursor: pointer; }
-                .btn-green { background: #22c55e; color: #fff; }
-                .btn-red { background: #ef4444; color: #fff; }
-                .btn-blue { background: #3b82f6; color: #fff; }
-                .btn-gray { background: #6b7280; color: #fff; }
-                table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-                th, td { padding: 10px; text-align: left; border-bottom: 1px solid #292524; font-size: 12px; }
-                th { color: #a8a29e; }
-                .user-details-box { background: #0c0a09; padding: 14px; border-radius: 8px; border: 1px solid #292524; margin-top: 10px; font-size: 13px; line-height: 1.8; }
-            </style>
-        </head>
-        <body>
-            <div class="header">
-                <h1>👑 BNB Smart Miner Admin Panel</h1>
-                <div>
-                    <a href="/admin/logout" class="logout-btn">Logout</a>
-                </div>
-            </div>
-
-            <div style="background: #1c1917; border: 1px solid #292524; border-radius: 10px; padding: 10px 15px; margin-bottom: 15px; font-size: 13px; color: #38bdf8; display: flex; justify-content: space-between; align-items: center;">
-                <span>📈 <b>Live BNB Price:</b> $${liveBnbPrice.toFixed(2)} USDT</span>
-                <span style="font-size: 11px; color: #a8a29e;">Auto-updated</span>
-            </div>
-
-            <div class="stats-grid">
-                <div class="stat-card"><div class="stat-title">Total Users</div><div class="stat-value">${totalUsers}</div></div>
-                <div class="stat-card"><div class="stat-title">Total User Deposit</div><div class="stat-value">${totalGlobalDepositUsdt.toFixed(2)} USDT<br><span style="font-size:13px; color:#22c55e;">(${totalGlobalDepositBnb.toFixed(4)} BNB)</span></div></div>
-                <div class="stat-card"><div class="stat-title">Total Active Plan Users ($1+)</div><div class="stat-value">${activeDepositUsersCount} Users</div></div>
-                <div class="stat-card"><div class="stat-title">Paid Out</div><div class="stat-value">${totalPaidOut.toFixed(4)} BNB<br><span style="font-size:13px; color:#38bdf8;">($${(totalPaidOut * liveBnbPrice).toFixed(2)} USDT)</span></div></div>
-                <div class="stat-card"><div class="stat-title">Pending Requests</div><div class="stat-value">${requests.length}</div></div>
-            </div>
-
-            <div class="nav-tabs">
-                <div class="nav-tab active" onclick="switchTab('tab-users', this)">👥 Users & Plans</div>
-                <div class="nav-tab" onclick="switchTab('tab-search', this)">🔍 Search & Manage</div>
-                <div class="nav-tab" onclick="switchTab('tab-requests', this)">⏳ Pending Requests (${requests.length})</div>
-                <div class="nav-tab" onclick="switchTab('tab-broadcast', this)">📢 Broadcast</div>
-            </div>
-
-            <div id="tab-users" class="tab-content active">
-                <div class="card">
-                    <h3>👥 Users With Active Plans ($1+ Deposits Only)</h3>
-                    ${activeDepositUsersList.length === 0 ? `<p style="font-size:12px; color:#a8a29e;">No active plan users found.</p>` : `
-                        <table>
-                            <tr><th>User ID</th><th>Username</th><th>Total Deposit</th><th>GHS Power</th><th>Plan Expiry</th></tr>
-                            ${activeDepositUsersList.map(depUser => {
-                                let depTotalUsdt = 0;
-                                if (depUser.deposits) {
-                                    depUser.deposits.forEach(d => {
-                                        if (d.status === 'PAID') depTotalUsdt += parseFloat(d.usdtAmount || 1);
-                                    });
-                                }
-                                let depTotalBnb = depTotalUsdt / liveBnbPrice;
-                                let displayUname = depUser.username ? (depUser.username.startsWith('@') ? depUser.username : '@' + depUser.username) : '@User';
-                                let planDaysStr = getPlanDaysFormat(depUser);
-                                return `
-                                    <tr>
-                                        <td><code>${depUser.id}</code></td>
-                                        <td>${displayUname}</td>
-                                        <td><b style="color:#22c55e;">${depTotalUsdt.toFixed(2)} USDT</b><br><span style="font-size:10px; color:#38bdf8;">(${depTotalBnb.toFixed(4)} BNB)</span></td>
-                                        <td><b>${depUser.ghs} GHS</b></td>
-                                        <td><b style="color:#38bdf8;">${planDaysStr}</b></td>
-                                    </tr>
-                                `;
-                            }).join('')}
-                        </table>
-                    `}
-                </div>
-            </div>
-
-            <div id="tab-search" class="tab-content">
-                <div class="card">
-                    <h3>🔍 Search User Details & Manage Plan</h3>
-                    <form method="GET" action="/admin/dashboard" class="search-box">
-                        <input type="text" name="search" placeholder="Enter Telegram User ID or Username" value="${searchId}">
-                        <button type="submit" class="btn">Search</button>
-                    </form>
-                    ${searchedUser ? `
-                        <div class="user-details-box">
-                            <p>👤 <b>User Name:</b> ${searchedUser.username.startsWith('@' ) ? searchedUser.username : '@' + searchedUser.username} | <b>ID:</b> <code>${searchedUser.id}</code></p>
-                            <p>💰 <b>Current Balance:</b> <span style="color:#38bdf8; font-weight:bold;">${searchedUser.balance.toFixed(4)} BNB</span> <span style="color:#22c55e;">($${(searchedUser.balance * liveBnbPrice).toFixed(2)} USDT)</span> | ⚡ <b>GHS Power:</b> ${searchedUser.ghs} GHS</p>
-                            <p>🚫 <b>Account Status:</b> ${searchedUser.isBanned ? '<span style="color:#ef4444; font-weight:bold;">BANNED</span>' : '<span style="color:#22c55e; font-weight:bold;">ACTIVE</span>'}</p>
-                            <p>⚡ <b>Mining Plan Status:</b> ${searchedUser.planActive !== false && searchedUser.ghs > 0 ? '<span style="color:#22c55e; font-weight:bold;">ACTIVE (' + getPlanDaysFormat(searchedUser) + ')</span>' : '<span style="color:#ef4444; font-weight:bold;">DEACTIVATED / EXPIRED (Free plan)</span>'}</p>
-                            <p>📥 <b>Total Approved Deposit:</b> <span style="color:#22c55e; font-weight:bold;">${userTotalDepositUsdt.toFixed(2)} USDT</span> <span style="color:#38bdf8;">(${(userTotalDepositUsdt / liveBnbPrice).toFixed(4)} BNB)</span></p>
-                            <p>📤 <b>Total Approved Withdraw:</b> <span style="color:#ef4444; font-weight:bold;">${userTotalWithdrawBnb.toFixed(4)} BNB</span> <span style="color:#38bdf8;">($${(userTotalWithdrawBnb * liveBnbPrice).toFixed(2)} USDT)</span> (<span style="color:#38bdf8;">${userPaidWithdrawCount} Times Paid</span>)</p>
-                            <p>👥 <b>Referrals Count:</b> L1: ${searchedUser.referrals?.level1?.length || 0} | L2: ${searchedUser.referrals?.level2?.length || 0} | L3: ${searchedUser.referrals?.level3?.length || 0}</p>
-                            <p>🎁 <b>Total Referral Commission:</b> <span style="color:#38bdf8; font-weight:bold;">${totalRefEarn.toFixed(4)} BNB</span> <span style="color:#22c55e;">($${(totalRefEarn * liveBnbPrice).toFixed(2)} USDT)</span></p>
-                            <p>🔗 <b>Referred By ID:</b> ${searchedUser.referredBy || 'Direct Join'}</p>
-                            <hr style="border-color:#292524; margin:12px 0;">
-                            <b>⚙️ Manage User Balance, Plan & Status:</b>
-                            <div style="display:flex; gap:10px; margin-top:8px; flex-wrap:wrap;">
-                                <input type="number" id="mod-amt" placeholder="Enter amount" style="flex:1; min-width:140px;">
-                                <button class="btn btn-green" onclick="modifyBal('${searchedUser.id}', 'add')">+ Add</button>
-                                <button class="btn btn-red" onclick="modifyBal('${searchedUser.id}', 'cut')">- Cut</button>
-                                <button class="btn btn-blue" onclick="togglePlan('${searchedUser.id}', 'activate')">⚡ Activate Plan (10 Days)</button>
-                                <button class="btn btn-red" onclick="togglePlan('${searchedUser.id}', 'deactivate')">❌ Deactivate Plan</button>
-                                <button class="btn btn-red" onclick="toggleBan('${searchedUser.id}', 'ban')">🚫 Ban User</button>
-                                <button class="btn btn-green" onclick="toggleBan('${searchedUser.id}', 'unban')">✅ Unban User</button>
-                            </div>
-                            <hr style="border-color:#292524; margin:12px 0;">
-                            <b>✉️ Send Personal Message to this User:</b>
-                            <div style="display:flex; gap:10px; margin-top:8px;">
-                                <input type="text" id="single-msg" placeholder="Type message for this user..." style="flex:1;">
-                                <button class="btn" onclick="sendSingleMsg('${searchedUser.id}')">Send Msg</button>
-                            </div>
-                        </div>
-                    ` : searchId ? `<p style="color:#ef4444; font-size:12px;">User not found!</p>` : ''}
-                </div>
-            </div>
-
-            <div id="tab-requests" class="tab-content">
-                <div class="card">
-                    <h3>⏳ Pending Requests</h3>
-                    ${requests.length === 0 ? `<p style="font-size:12px; color:#a8a29e;">No pending requests right now.</p>` : `
-                        <table>
-                            <tr><th>Type</th><th>User ID</th><th>Amount</th><th>Details</th><th>Action</th></tr>
-                            ${requests.map(r => `
-                                <tr>
-                                    <td style="color:${r.type==='deposit'?'#22c55e':'#ef4444'}; font-weight:bold;">${r.type.toUpperCase()}</td>
-                                    <td>${r.userId}</td>
-                                    <td><b>${r.amount}</b></td>
-                                    <td>${r.txHash ? 'Tx: ' + r.txHash.substring(0,10) + '...' : 'Addr: ' + r.address.substring(0,10) + '...'}</td>
-                                    <td>
-                                        <button class="btn btn-green" style="padding:4px 8px; font-size:11px;" onclick="handleReq('${r.reqId}', 'approve')">Approve</button>
-                                        <button class="btn btn-red" style="padding:4px 8px; font-size:11px;" onclick="handleReq('${r.reqId}', 'reject')">Reject</button>
-                                        <button class="btn btn-gray" style="padding:4px 8px; font-size:11px;" onclick="handleReq('${r.reqId}', 'close')">Close</button>
-                                    </td>
-                                </tr>
-                            `).join('')}
-                        </table>
-                    `}
-                </div>
-            </div>
-
-            <div id="tab-broadcast" class="tab-content">
-                <div class="card">
-                    <h3>📢 Broadcast Message with Photo to All Users</h3>
-                    <input type="text" id="bc-photo" placeholder="Enter Direct Image URL (Optional)" style="margin-bottom:10px;">
-                    <textarea id="bc-msg" placeholder="Write message to send to all bot users..."></textarea>
-                    <button class="btn" style="margin-top:10px; width:100%;" onclick="sendBroadcast()">Send Broadcast Message</button>
-                </div>
-            </div>
-
-            <script>
-                function switchTab(tabId, el) {
-                    document.querySelectorAll('.tab-content').forEach(tc => tc.classList.remove('active'));
-                    document.querySelectorAll('.nav-tab').forEach(nt => nt.classList.remove('active'));
-                    document.getElementById(tabId).classList.add('active');
-                    el.classList.add('active');
-                }
-
-                if('${searchId}' !== '') {
-                    switchTab('tab-search', document.querySelectorAll('.nav-tab')[1]);
-                }
-
-                async function handleReq(reqId, action) {
-                    let res = await fetch('/admin/action', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ reqId, action })
-                    });
-                    let data = await res.json();
-                    alert(data.message);
-                    location.reload();
-                }
-                async function modifyBal(userId, action) {
-                    let amount = document.getElementById('mod-amt').value;
-                    if(!amount) return alert("Enter amount!");
-                    let res = await fetch('/admin/manage-balance', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ userId, amount, action })
-                    });
-                    let data = await res.json();
-                    alert(data.message);
-                    location.reload();
-                }
-                async function togglePlan(userId, action) {
-                    let res = await fetch('/admin/manage-plan', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ userId, action })
-                    });
-                    let data = await res.json();
-                    alert(data.message);
-                    location.reload();
-                }
-                async function toggleBan(userId, action) {
-                    let res = await fetch('/admin/ban-user', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ userId, action })
-                    });
-                    let data = await res.json();
-                    alert(data.message);
-                    location.reload();
-                }
-                async function sendSingleMsg(userId) {
-                    let message = document.getElementById('single-msg').value;
-                    if(!message) return alert("Enter message!");
-                    let res = await fetch('/admin/send-single', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ userId, message })
-                    });
-                    let data = await res.json();
-                    alert(data.message);
-                    document.getElementById('single-msg').value = '';
-                }
-                async function sendBroadcast() {
-                    let message = document.getElementById('bc-msg').value;
-                    let photoUrl = document.getElementById('bc-photo').value;
-                    if(!message && !photoUrl) return alert("Please enter message or photo URL!");
-                    let res = await fetch('/admin/broadcast', {
-                        method: 'POST',
-                        headers: {'Content-Type': 'application/json'},
-                        body: JSON.stringify({ message, photoUrl })
-                    });
-                    let data = await res.json();
-                    alert(data.message);
-                }
-            </script>
-        </body>
-        </html>
-    `;
-    res.send(html);
-});
-
-app.post('/admin/manage-plan', checkAdminAuth, async (req, res) => {
-    const { userId, action } = req.body;
-    let u = await User.findOne({ id: userId });
-    if (!u) return res.status(404).json({ success: false, message: "User not found!" });
-
-    const now = Date.now();
-    settleAccrual(u, now);
-
-    if (action === 'activate') {
-        u.planActive = true;
-        if (u.ghs <= 0) u.ghs = 1;
-        u.planStartDate = now;
-        u.planExpiryDate = now + PLAN_DURATION_MS;
-        await u.save();
-        sendTelegramMessage(userId, `⚡ *Plan Activated:* Admin has activated your mining plan for 10 Days!`);
-        res.json({ success: true, message: `Plan activated successfully for user ${userId}!` });
-    } else {
-        u.planActive = false;
-        u.ghs = 0;
-        u.planStartDate = 0;
-        u.planExpiryDate = 0;
-        await u.save();
-        sendTelegramMessage(userId, `❌ *Plan Expired:* Your plan was expired plzz renew plan agin 🚀`);
-        res.json({ success: true, message: `Plan deactivated successfully for user ${userId}!` });
-    }
-});
-
-app.post('/admin/action', checkAdminAuth, async (req, res) => {
+app.post('/admin/action', checkAdmin, wrap(async (req, res) => {
     const { reqId, action } = req.body;
+    if (!['approve', 'reject'].includes(action)) return res.json({ ok: false, message: 'Invalid action' });
+    const r = await processRequest(String(reqId), action);
+    res.json({ ok: !!r, message: r ? `Request ${action}d!` : 'Request already handled / not found' });
+}));
 
-    const reqDoc = await PendingRequest.findOneAndDelete({ reqId });
-    if (!reqDoc) return res.status(404).json({ success: false, message: "Request not found" });
+app.post('/admin/balance', checkAdmin, wrap(async (req, res) => {
+    const { userId, action } = req.body, amt = Math.floor(Number(req.body.amount));
+    if (!Number.isFinite(amt) || amt <= 0) return res.json({ ok: false, message: 'Invalid amount' });
+    let u;
+    if (action === 'add') u = await User.findOneAndUpdate({ id: String(userId) }, { $inc: { balance: amt } }, { new: true });
+    else u = await User.findOneAndUpdate({ id: String(userId), balance: { $gte: amt } }, { $inc: { balance: -amt } }, { new: true });
+    if (!u) return res.json({ ok: false, message: 'User not found or balance too low' });
+    sendMsg(u.id, action === 'add' ? `🎁 Admin added +${amt} SHIBA to your balance!` : `⚠️ Admin deducted ${amt} SHIBA from your balance.`);
+    res.json({ ok: true, message: `Done. New balance: ${u.balance} SHIBA` });
+}));
 
-    const u = await User.findOne({ id: reqDoc.userId });
+app.post('/admin/ban', checkAdmin, wrap(async (req, res) => {
+    const ban = req.body.action === 'ban';
+    const u = await User.findOneAndUpdate({ id: String(req.body.userId) }, { isBanned: ban }, { new: true });
+    if (!u) return res.json({ ok: false, message: 'User not found' });
+    sendMsg(u.id, ban ? '🚫 <b>Account Banned</b> by admin.' : '✅ <b>Account Unbanned</b> by admin.');
+    res.json({ ok: true, message: ban ? 'User banned' : 'User unbanned' });
+}));
 
-    if (action === 'approve') {
-        await approveRequest(reqDoc, u, reqId);
-    } else if (action === 'reject') {
-        await rejectRequest(reqDoc, u, reqId);
-    } else if (action === 'close') {
-        if (reqDoc.type === 'deposit' && u) {
-            let idx = u.deposits.findIndex(d => String(d.id) === String(reqId));
-            if (idx !== -1) u.deposits[idx].status = 'CLOSED';
-            u.markModified('deposits');
-            await u.save();
-        } else if (reqDoc.type === 'withdraw' && u) {
-            u.balance += parseFloat(reqDoc.amount);
-            let idx = u.withdrawals.findIndex(w => String(w.id) === String(reqId));
-            if (idx !== -1) u.withdrawals[idx].status = 'CLOSED';
-            u.markModified('withdrawals');
-            await u.save();
-        }
-    }
+app.post('/admin/msg', checkAdmin, wrap(async (req, res) => {
+    const u = await User.findOne({ id: String(req.body.userId) });
+    if (!u) return res.json({ ok: false, message: 'User not found' });
+    await sendMsg(u.id, `📩 Message from Admin:\n\n${String(req.body.message).slice(0, 3000)}`, undefined, false);
+    res.json({ ok: true, message: 'Message sent!' });
+}));
 
-    res.json({ success: true, message: "Action executed successfully!" });
-});
+app.post('/admin/broadcast', checkAdmin, wrap(async (req, res) => {
+    const message = String(req.body.message || '').slice(0, 3500);
+    if (!message.trim()) return res.json({ ok: false, message: 'Empty message' });
+    const ids = (await User.find({ isBanned: false }, { id: 1 })).map(u => u.id);
+    res.json({ ok: true, message: `Broadcast started for ${ids.length} users.` });
+    for (const id of ids) { await sendMsg(id, message, undefined, false); await sleep(60); } // Telegram limit se bachne ke liye
+}));
 
-app.post('/admin/manage-balance', checkAdminAuth, async (req, res) => {
-    const { userId, amount, action } = req.body;
-    let u = await User.findOne({ id: userId });
-    if (!u) return res.status(404).json({ success: false, message: "User not found!" });
-
-    let amt = parseFloat(amount);
-    if (action === 'add') {
-        u.balance += amt;
-        sendTelegramMessage(userId, `🎁 Admin added +${amt} BNB to your balance!`);
-    } else {
-        u.balance = Math.max(0, u.balance - amt);
-        sendTelegramMessage(userId, `⚠️ Admin deducted -${amt} BNB from your balance.`);
-    }
-    await u.save();
-    res.json({ success: true, message: `Successfully ${action}ed ${amt} BNB for user ${userId}!` });
-});
-
-app.post('/admin/ban-user', checkAdminAuth, async (req, res) => {
-    const { userId, action } = req.body;
-    let u = await User.findOne({ id: userId });
-    if (!u) return res.status(404).json({ success: false, message: "User not found!" });
-
-    if (action === 'ban') {
-        u.isBanned = true;
-        await u.save();
-        sendTelegramMessage(userId, `🚫 *Account Banned:* You have been banned by the admin.`);
-        res.json({ success: true, message: `User ${userId} has been banned successfully!` });
-    } else {
-        u.isBanned = false;
-        await u.save();
-        sendTelegramMessage(userId, `✅ *Account Unbanned:* Your account has been unbanned by the admin.`);
-        res.json({ success: true, message: `User ${userId} has been unbanned successfully!` });
-    }
-});
-
-app.post('/admin/send-single', checkAdminAuth, async (req, res) => {
-    const { userId, message } = req.body;
-    let u = await User.findOne({ id: userId });
-    if (!u) return res.status(404).json({ success: false, message: "User not found!" });
-
-    await sendTelegramMessage(userId, `📩 *Message from Admin:*\n\n${message}`);
-    res.json({ success: true, message: `Message sent to user ${userId} successfully!` });
-});
-
-app.post('/admin/broadcast', checkAdminAuth, async (req, res) => {
-    const { message, photoUrl } = req.body;
-    const users = await User.find({});
-    let count = 0;
-    for (let u of users) {
-        if (photoUrl && photoUrl.trim() !== '') {
-            await sendTelegramPhoto(u.id, photoUrl.trim(), message || '');
-        } else if (message && message.trim() !== '') {
-            await sendTelegramMessage(u.id, message);
-        }
-        count++;
-    }
-    res.json({ success: true, message: `Broadcast sent to ${count} users successfully!` });
-});
-
-// ================== MINI APP API ==================
-app.get('/api/user/:userId', async (req, res) => {
-    const userId = String(req.params.userId);
-    let user = await User.findOne({ id: userId });
-
-    if (user && user.isBanned) {
-        return res.status(403).json({ success: false, isBanned: true, message: "Your account is banned by admin." });
-    }
-
-    const now = Date.now();
-
-    if (!user) {
-        user = new User({ id: userId, username: 'User' });
-        await user.save();
-    } else if (user.planActive && user.planExpiryDate && user.planExpiryDate > 0 && now >= user.planExpiryDate) {
-        expireUserPlan(user, now);
-        await user.save();
-    }
-
-    const price = await getBnbPrice();
-    const data = user.toObject();
-
-    ['level1', 'level2', 'level3'].forEach(lvl => {
-        if (data.referrals && Array.isArray(data.referrals[lvl])) {
-            data.referrals[lvl] = data.referrals[lvl].map(r => {
-                if (typeof r === 'string') {
-                    return { id: r, joinedDate: 'Active', bonusEarned: 0 };
-                }
-                return {
-                    id: r.id || r,
-                    joinedDate: r.joinedDate || 'Active',
-                    bonusEarned: Number(r.bonusEarned || 0)
-                };
-            });
-        }
-    });
-
-    data.pendingUsd = Number(user.accruedUsd || 0) + accrueUsd(user, now);
-    data.dailyUsd = dailyUsdRate(user, now);
-    data.paidPlan = isPaidPlanActive(user, now);
-    data.bnbPrice = price;
-    res.json(data);
-});
-
-app.post('/api/update-ghs', async (req, res) => {
-    const { userId } = req.body;
-    let u = await User.findOne({ id: String(userId) });
-    if (u && u.isBanned) return res.status(403).json({ success: false, isBanned: true, message: "Your account is banned." });
-    res.json({ success: true, ghs: u ? u.ghs : 0 });
-});
-
-app.post('/api/claim', async (req, res) => {
-    const userId = String(req.body.userId || '');
-    const u = await User.findOne({ id: userId });
-    if (!u || u.isBanned) return res.status(400).json({ success: false, message: "User not found or banned" });
-
-    const now = Date.now();
-    const accrued = accrueUsd(u, now);
-    const totalUsd = Number(u.accruedUsd || 0) + accrued;
-    if (!(totalUsd > 0)) return res.status(400).json({ success: false, message: "Nothing to collect yet" });
-
-    const price = await getBnbPrice();
-    const bnbAmount = totalUsd / price;
-
-    u.balance += bnbAmount;
-    u.totalMinedUsd = Number(u.totalMinedUsd || 0) + totalUsd;
-    u.accruedUsd = 0;
-    u.lastClaimTime = now;
-    await u.save();
-
-    res.json({
-        success: true,
-        balance: u.balance,
-        lastClaimTime: u.lastClaimTime,
-        claimedBnb: bnbAmount,
-        claimedUsd: totalUsd,
-        bnbPrice: price
-    });
-});
-
-app.post('/api/deposit', async (req, res) => {
-    const { userId, username, amount, usdtAmount, coin, txHash } = req.body;
-    if (!userId || !amount || !txHash) {
-        return res.status(400).json({ success: false, message: "Invalid deposit data." });
-    }
-
-    const cleanTxHash = String(txHash).trim();
-
-    const existingPending = await PendingRequest.findOne({ txHash: cleanTxHash });
-    if (existingPending) {
-        return res.status(400).json({
-            success: false,
-            message: "This TxHash has already been submitted and is currently pending!"
-        });
-    }
-
-    const existingUserHash = await User.findOne({ "deposits.txHash": cleanTxHash });
-    if (existingUserHash) {
-        return res.status(400).json({
-            success: false,
-            message: "This TxHash has already been used! Please provide a new transaction hash."
-        });
-    }
-
-    let u = await User.findOne({ id: userId });
-    if (u && u.isBanned) return res.status(403).json({ success: false, isBanned: true, message: "Your account is banned." });
-    if (!u) u = new User({ id: userId, username: username || 'User' });
-
-    if (username && username !== 'User') {
-        u.username = username;
-    }
-
-    let exactUsdtVal = Number(usdtAmount) || 1;
-    const reqId = 'dep_' + Date.now();
-
-    u.deposits.unshift({
-        id: reqId,
-        amount: amount,
-        usdtAmount: exactUsdtVal,
-        coin: coin || 'BNB',
-        txHash: cleanTxHash,
-        status: 'PENDING',
-        date: new Date().toLocaleDateString()
-    });
-    u.markModified('deposits');
-    await u.save();
-
-    await PendingRequest.create({
-        reqId,
-        type: 'deposit',
-        userId,
-        amount: amount,
-        usdtAmount: exactUsdtVal,
-        coin: coin || 'BNB',
-        txHash: cleanTxHash,
-        status: 'PENDING'
-    });
-
-    if (ADMIN_ID) {
-        const msgText = `📥 **New Deposit Request**\n\n👤 User ID: \`${userId}\`\n💰 Amount: **${amount}** (${exactUsdtVal} USDT)\n🪙 Coin: **${coin || 'BNB'}**\n🔑 TxHash: \`${cleanTxHash}\``;
-        const inlineKeyboard = {
-            inline_keyboard: [[
-                { text: "✅ Approve", callback_data: `approve_${reqId}` },
-                { text: "❌ Reject", callback_data: `reject_${reqId}` }
-            ]]
-        };
-        await sendTelegramMessage(ADMIN_ID, msgText, inlineKeyboard);
-    }
-
-    res.json({ success: true, message: "Deposit request submitted successfully" });
-});
-
-app.post('/api/withdraw', async (req, res) => {
-    const { userId, username, amount, address } = req.body;
-    let amt = parseFloat(amount);
-    if (!userId || !amt || isNaN(amt) || amt <= 0 || !address) {
-        return res.status(400).json({ success: false, message: "Invalid withdrawal data" });
-    }
-
-    let u = await User.findOne({ id: userId });
-    if (!u || u.isBanned) {
-        return res.status(403).json({ success: false, message: "Account restricted or banned" });
-    }
-
-    const existingPending = await PendingRequest.findOne({ userId: userId, type: 'withdraw', status: 'PENDING' });
-    if (existingPending) {
-        return res.status(400).json({
-            success: false,
-            message: "Aapki pehle se ek withdrawal request pending hai. Pehle wo process hone dein!"
-        });
-    }
-
-    if (u.balance < amt) {
-        return res.status(400).json({ success: false, message: "Insufficient balance for withdrawal!" });
-    }
-
-    if (username && username !== 'User') {
-        u.username = username;
-    }
-
-    u.balance = Math.max(0, u.balance - amt);
-
-    const reqId = 'wd_' + Date.now();
-    u.withdrawals.unshift({
-        id: reqId,
-        amount: amt,
-        address,
-        status: 'PENDING',
-        date: new Date().toLocaleDateString()
-    });
-    u.markModified('withdrawals');
-    await u.save();
-
-    await PendingRequest.create({
-        reqId,
-        type: 'withdraw',
-        userId,
-        amount: amt,
-        address,
-        status: 'PENDING'
-    });
-
-    if (ADMIN_ID) {
-        const msgText = `📤 **New Withdraw Request**\n\n👤 User ID: \`${userId}\`\n💰 Amount: **${amt} BNB**\n🏦 Address: \`${address}\``;
-        const inlineKeyboard = {
-            inline_keyboard: [[
-                { text: "✅ Approve", callback_data: `approve_${reqId}` },
-                { text: "❌ Reject", callback_data: `reject_${reqId}` }
-            ]]
-        };
-        await sendTelegramMessage(ADMIN_ID, msgText, inlineKeyboard);
-    }
-
-    res.json({ success: true, message: "Withdrawal request submitted successfully", newBalance: u.balance });
-});
-
+// ================== START ==================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
     console.log(`Server running on port ${PORT}`);
-    const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
-    if (RENDER_URL && BOT_TOKEN) {
-        try {
-            await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/setWebhook?url=${RENDER_URL}/api/webhook/${BOT_TOKEN}`);
-            console.log("Telegram Webhook Set Successfully!");
-        } catch (e) {
-            console.log("Failed to set webhook:", e);
-        }
+    if (PUBLIC_URL.startsWith('https://')) {
+        const r = await tg('setWebhook', { url: `${PUBLIC_URL}/api/webhook`, secret_token: WEBHOOK_SECRET, allowed_updates: ['message', 'callback_query'] });
+        console.log(r.ok ? '✅ Telegram webhook set' : '❌ Webhook failed', r.description || '');
+    } else {
+        console.log('⚠️ PUBLIC_URL (https) not set - webhook not configured.');
     }
 });
