@@ -4,9 +4,8 @@ const crypto = require('crypto');
 const path = require('path');
 const app = express();
 app.disable('x-powered-by');
-app.set('trust proxy', 1); // Render proxy ke peeche sahi IP (login rate-limit ke liye)
+app.set('trust proxy', 1);
 
-// ================== SETTINGS (Environment Variables) ==================
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = String(process.env.ADMIN_ID || '7482625921');
 const MONGO_URI = process.env.MONGO_URI || process.env.MONGODB_URI;
@@ -20,20 +19,18 @@ if (!BOT_TOKEN || !MONGO_URI || !ADMIN_USERNAME || !ADMIN_PASSWORD) {
 }
 const WEBHOOK_SECRET = crypto.createHash('sha256').update('wh' + BOT_TOKEN).digest('hex').slice(0, 32);
 
-// ================== RULES ==================
 const DAILY = 1000;
 const TASK_REWARD = 500;
 const REF_BONUS = 500;
 const MIN_WITHDRAW = 5000;
 const COOLDOWN = 24 * 60 * 60 * 1000;
 
-// Sirf 2 channels (Index 0 aur 1)
+// Sirf 2 channels
 const CHANNELS = [
     { id: '@updatechanneluta', name: 'Channel 1' },
     { id: '@paymentchanneluta', name: 'Channel 2' }
 ];
 
-// ================== DATABASE ==================
 mongoose.connect(MONGO_URI)
     .then(() => console.log('✅ MongoDB connected'))
     .catch(err => { console.error('❌ MongoDB error:', err.message); process.exit(1); });
@@ -61,7 +58,6 @@ const PendingRequest = mongoose.model('PendingRequest', new mongoose.Schema({
     address: { type: String, required: true }
 }));
 
-// ================== HELPERS ==================
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const wrap = fn => (req, res, next) => fn(req, res, next).catch(e => { console.log('Error:', e); res.status(500).json({ ok: false, error: 'Server error' }); });
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -77,26 +73,25 @@ async function tg(method, body) {
 const sendMsg = (chat_id, text, reply_markup, html = true) =>
     tg('sendMessage', { chat_id, text, reply_markup, ...(html ? { parse_mode: 'HTML' } : {}) });
 
-// Bot in channels ka ADMIN hona zaroori hai
 async function isMember(channel, userId) {
     const r = await tg('getChatMember', { chat_id: channel, user_id: Number(userId) });
     if (!r.ok) { console.log('getChatMember failed for', channel, r.description || ''); return null; }
     const s = r.result.status;
     return ['member', 'administrator', 'creator'].includes(s) || (s === 'restricted' && r.result.is_member === true);
 }
+
 async function checkChannels(userId, idxs = [0, 1]) {
     const missing = [];
     for (const i of idxs) {
         const ch = CHANNELS[i];
         if (!ch) return { ok: false, error: 'Invalid channel' };
         const m = await isMember(ch.id, userId);
-        if (m === null) return { ok: false, error: 'Channel check failed. Please make sure bot is admin in the channels.' };
+        if (m === null) return { ok: false, error: 'Channel check failed. Make sure bot is admin in channels.' };
         if (!m) missing.push(ch.name);
     }
     return { ok: missing.length === 0, missing };
 }
 
-// Telegram Mini App signature check
 function validateInitData(initData) {
     if (!initData || initData.length > 4096) return null;
     const p = new URLSearchParams(initData);
@@ -117,7 +112,7 @@ function displayName(u) { return u.username ? `@${u.username}` : (u.first_name |
 async function auth(req, res, next) {
     try {
         const u = validateInitData(req.headers['x-init-data']);
-        if (!u || !u.id) return res.status(401).json({ ok: false, error: 'Please open the app via the "Open AlphaX" button inside the bot.' });
+        if (!u || !u.id) return res.status(401).json({ ok: false, error: 'Please open via bot.' });
         const id = String(u.id);
         const user = await User.findOneAndUpdate({ id }, { $set: { username: displayName(u) } }, { upsert: true, new: true, setDefaultsOnInsert: true });
         if (user.isBanned) return res.status(403).json({ ok: false, banned: true, error: 'Your account is banned.' });
@@ -142,12 +137,11 @@ app.use((req, res, next) => { res.setHeader('X-Content-Type-Options', 'nosniff')
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (req, res) => res.send('OK'));
 
-// ================== MINI APP API ==================
 app.post('/api/me', auth, wrap(async (req, res) => {
     let u = req.user;
     if (u.isVerified) { 
         const r = await checkChannels(u.id);
-        if (!r.ok && !r.error) { await User.updateOne({ id: u.id }, { isVerified: false }); u = await User.findOne({ id: u.id }); }
+        if (!r.ok) { await User.updateOne({ id: u.id }, { isVerified: false }); u = await User.findOne({ id: u.id }); }
     }
     res.json({ ok: true, data: publicUser(u) });
 }));
@@ -175,7 +169,6 @@ app.post('/api/verify', auth, wrap(async (req, res) => {
 app.post('/api/claim', auth, wrap(async (req, res) => {
     if (!req.user.isVerified) return res.json({ ok: false, error: 'Please verify channels first.' });
     const c = await checkChannels(req.user.id);
-    if (c.error) return res.json({ ok: false, error: c.error });
     if (!c.ok) {
         await User.updateOne({ id: req.user.id }, { isVerified: false });
         return res.json({ ok: false, error: 'Please join the required channels first!' });
@@ -195,7 +188,6 @@ app.post('/api/task', auth, wrap(async (req, res) => {
     if (!u.isVerified) return res.json({ ok: false, error: 'Please verify channels first.' });
     
     const r = await checkChannels(u.id, [id - 1]); 
-    if (r.error) return res.json({ ok: false, error: r.error });
     if (!r.ok) return res.json({ ok: false, error: 'Please join the channel first!' });
 
     const key = `tasks.task${id}`;
@@ -227,22 +219,6 @@ app.post('/api/withdraw', auth, wrap(async (req, res) => {
     res.json({ ok: true, data: publicUser(upd) });
 }));
 
-// ================== APPROVE / REJECT ==================
-async function processRequest(reqId, action) {
-    const r = await PendingRequest.findOneAndDelete({ reqId });
-    if (!r) return null;
-    const af = { arrayFilters: [{ 'w.id': reqId }] };
-    if (action === 'approve') {
-        await User.updateOne({ id: r.userId }, { $set: { 'withdrawals.$[w].status': 'PAID' }, $inc: { totalWithdrawn: r.amount } }, af);
-        sendMsg(r.userId, `✅ Your withdrawal of <b>${r.amount} SHIBA</b> has been approved and paid!`);
-    } else {
-        await User.updateOne({ id: r.userId }, { $set: { 'withdrawals.$[w].status': 'DECLINED' }, $inc: { balance: r.amount } }, af);
-        sendMsg(r.userId, `❌ Your withdrawal of <b>${r.amount} SHIBA</b> was declined and the amount was refunded.`);
-    }
-    return r;
-}
-
-// ================== TELEGRAM WEBHOOK ==================
 app.post('/api/webhook', async (req, res) => {
     if (req.headers['x-telegram-bot-api-secret-token'] !== WEBHOOK_SECRET) return res.sendStatus(403);
     res.sendStatus(200);
@@ -275,16 +251,24 @@ app.post('/api/webhook', async (req, res) => {
             const m = data.match(/^(approve|reject)_(wd_[a-f0-9]+)$/);
             if (!m) return;
             if (chatId !== ADMIN_ID) return tg('answerCallbackQuery', { callback_query_id: q.id, text: 'Unauthorized!' });
-            const r = await processRequest(m[2], m[1]);
-            if (!r) return tg('answerCallbackQuery', { callback_query_id: q.id, text: 'Already handled!' });
+            const reqId = m[2];
+            const pr = await PendingRequest.findOneAndDelete({ reqId });
+            if (!pr) return tg('answerCallbackQuery', { callback_query_id: q.id, text: 'Already handled!' });
+            const af = { arrayFilters: [{ 'w.id': reqId }] };
+            if (m[1] === 'approve') {
+                await User.updateOne({ id: pr.userId }, { $set: { 'withdrawals.$[w].status': 'PAID' }, $inc: { totalWithdrawn: pr.amount } }, af);
+                sendMsg(pr.userId, `✅ Your withdrawal of <b>${pr.amount} SHIBA</b> has been approved and paid!`);
+            } else {
+                await User.updateOne({ id: pr.userId }, { $set: { 'withdrawals.$[w].status': 'DECLINED' }, $inc: { balance: pr.amount } }, af);
+                sendMsg(pr.userId, `❌ Your withdrawal of <b>${pr.amount} SHIBA</b> was declined and the amount was refunded.`);
+            }
             tg('editMessageText', { chat_id: chatId, message_id: q.message.message_id, parse_mode: 'HTML',
-                text: `${m[1] === 'approve' ? '✅ <b>Approved</b>' : '❌ <b>Rejected</b>'}\nUser ID: ${esc(r.userId)}\nAmount: ${r.amount} SHIBA` });
+                text: `${m[1] === 'approve' ? '✅ <b>Approved</b>' : '❌ <b>Rejected</b>'}\nUser ID: ${esc(pr.userId)}\nAmount: ${pr.amount} SHIBA` });
             tg('answerCallbackQuery', { callback_query_id: q.id, text: 'Done!' });
         }
     } catch (e) { console.log('Webhook error:', e); }
 });
 
-// ================== ADMIN PANEL ==================
 const sessions = new Map();
 const attempts = new Map();
 const parseCookies = h => Object.fromEntries((h || '').split(';').map(c => c.trim().split('=')).filter(p => p[0]).map(p => [p[0], decodeURIComponent(p.slice(1).join('='))]));
@@ -378,8 +362,17 @@ if(a!=='msg'&&a!=='bc')location.reload()});
 app.post('/admin/action', checkAdmin, wrap(async (req, res) => {
     const { reqId, action } = req.body;
     if (!['approve', 'reject'].includes(action)) return res.json({ ok: false, message: 'Invalid action' });
-    const r = await processRequest(String(reqId), action);
-    res.json({ ok: !!r, message: r ? `Request ${action}d!` : 'Request already handled / not found' });
+    const pr = await PendingRequest.findOneAndDelete({ reqId: String(reqId) });
+    if (!pr) return res.json({ ok: false, message: 'Request already handled / not found' });
+    const af = { arrayFilters: [{ 'w.id': reqId }] };
+    if (action === 'approve') {
+        await User.updateOne({ id: pr.userId }, { $set: { 'withdrawals.$[w].status': 'PAID' }, $inc: { totalWithdrawn: pr.amount } }, af);
+        sendMsg(pr.userId, `✅ Your withdrawal of <b>${pr.amount} SHIBA</b> has been approved and paid!`);
+    } else {
+        await User.updateOne({ id: pr.userId }, { $set: { 'withdrawals.$[w].status': 'DECLINED' }, $inc: { balance: pr.amount } }, af);
+        sendMsg(pr.userId, `❌ Your withdrawal of <b>${pr.amount} SHIBA</b> was declined and the amount was refunded.`);
+    }
+    res.json({ ok: true, message: `Request ${action}d!` });
 }));
 
 app.post('/admin/balance', checkAdmin, wrap(async (req, res) => {
@@ -416,7 +409,6 @@ app.post('/admin/broadcast', checkAdmin, wrap(async (req, res) => {
     for (const id of ids) { await sendMsg(id, message, undefined, false); await sleep(60); }
 }));
 
-// ================== START ==================
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, async () => {
     console.log(`Server running on port ${PORT}`);
